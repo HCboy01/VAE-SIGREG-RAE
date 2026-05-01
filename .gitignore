@@ -1,0 +1,9 @@
+checkpoints/
+logs/
+wandb/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.bin
+*.npy
