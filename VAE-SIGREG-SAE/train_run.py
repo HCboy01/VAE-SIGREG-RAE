@@ -141,6 +141,8 @@ def parse_args():
     # checkpointing
     p.add_argument("--ckpt_dir",   type=str, default="checkpoints")
     p.add_argument("--save_every", type=int, default=10)
+    p.add_argument("--resume",       type=str, default=None, help="full resume: load model+optimizer+epoch")
+    p.add_argument("--init_weights", type=str, default=None, help="load model weights only, train from epoch 1")
 
     # wandb
     p.add_argument("--wandb_project",  type=str,  default="vae-sigreg-sae")
@@ -202,6 +204,22 @@ def main():
     )
     scheduler = make_scheduler(optimizer, args.warmup_epochs, args.epochs)
 
+    # --- Resume / Init ---
+    start_epoch = 1
+    best_val_total = float("inf")
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        optimizer.load_state_dict(ckpt["optimizer"])
+        start_epoch = ckpt["epoch"] + 1
+        for _ in range(ckpt["epoch"]):
+            scheduler.step()
+        print(f"Resumed from {args.resume}  (epoch {ckpt['epoch']} → continuing from {start_epoch})")
+    elif args.init_weights:
+        ckpt = torch.load(args.init_weights, map_location=device)
+        model.load_state_dict(ckpt["model"])
+        print(f"Weights loaded from {args.init_weights}  (training from epoch 1)")
+
     # --- wandb ---
     wandb.init(
         project=args.wandb_project,
@@ -217,9 +235,7 @@ def main():
     # ---------------------------------------------------------------------------
     # Training loop
     # ---------------------------------------------------------------------------
-    best_val_total = float("inf")
-
-    for epoch in range(1, args.epochs + 1):
+    for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
 
         # KL annealing: linearly ramp beta from 0 → beta_kl over warmup epochs
