@@ -56,13 +56,23 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--precision", type=str, default="bf16", choices=["fp32", "bf16", "fp16"])
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--cfg-scale", type=float, default=1.0)
+    p.add_argument("--cfg-t-min", type=float, default=0.0)
+    p.add_argument("--cfg-t-max", type=float, default=1.0)
+    p.add_argument("--sampler-method", type=str, default="euler")
+    p.add_argument("--num-steps", type=int, default=50)
     p.add_argument("--keep-samples", action="store_true", help="Keep generated images after FID computation")
     p.add_argument("--resume", action="store_true", help="Skip already-generated images in out-dir and continue")
+    p.add_argument("--add-null", action="store_true", help="Add null_cond to z_gaussian before conditioning")
+    p.add_argument("--az-scale", type=float, default=None, help="Use null_cond + az_scale*z_gaussian as condition")
     return p.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    if args.cfg_scale > 1.0 and not (args.cfg_t_min < args.cfg_t_max):
+        raise ValueError("--cfg-t-min must be smaller than --cfg-t-max when using CFG.")
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda":
         raise RuntimeError("CUDA required.")
@@ -127,14 +137,15 @@ def main() -> None:
     transport_params.pop("time_dist_shift", None)
     transport = create_transport(**transport_params, time_dist_shift=time_dist_shift)
     sampler = Sampler(transport)
-    sample_fn = sampler.sample_ode(sampling_method="euler", num_steps=50, atol=1e-6, rtol=1e-3)
+    sample_fn = sampler.sample_ode(sampling_method=args.sampler_method, num_steps=args.num_steps, atol=1e-6, rtol=1e-3)
 
     latent_size = tuple(int(v) for v in misc_cfg.get("latent_size", [768, 16, 16]))
 
     # ── Output dir ────────────────────────────────────────────────────────────
     ckpt_path = Path(args.ckpt)
     out_dir = Path(args.out_dir) if args.out_dir else ckpt_path.parent / "gaussian_fid"
-    sample_dir = out_dir / ckpt_path.stem
+    scale_name = f"cfg{args.cfg_scale:g}".replace(".", "p")
+    sample_dir = out_dir / ckpt_path.stem / scale_name
     sample_dir.mkdir(parents=True, exist_ok=True)
     print(f"[info] saving generated images to: {sample_dir}", flush=True)
 
@@ -157,9 +168,36 @@ def main() -> None:
 
             z_noise = torch.randn(bsz, *latent_size, device=device)
             z_cond = torch.randn(bsz, cond_dim, device=device)
+            if args.az_scale is not None:
+                null = model.null_cond.expand(bsz, -1).to(device=z_cond.device, dtype=z_cond.dtype)
+                z_cond = null + args.az_scale * z_cond
+            elif args.add_null:
+                z_cond = z_cond + model.null_cond.expand(bsz, -1).to(device=z_cond.device, dtype=z_cond.dtype)
+            z = torch.cat([z_noise, z_noise], dim=0)
+            cond = z_cond.to(amp_dtype if use_amp else torch.float32)
+            null_cond = model.null_cond.expand(bsz, -1).to(device=cond.device, dtype=cond.dtype)
+            cond_combined = torch.cat([cond, null_cond], dim=0)
+            cfg_scale = args.cfg_scale
+            cfg_interval = (args.cfg_t_min, args.cfg_t_max)
+
+            def cfg_forward(x, t, cond=None):
+                half = x[: len(x) // 2]
+                combined = torch.cat([half, half], dim=0)
+                model_out = model.forward(combined, t, cond=cond)
+                eps, rest = model_out[:, : model.in_channels], model_out[:, model.in_channels :]
+                cond_eps, uncond_eps = torch.split(eps, len(eps) // 2, dim=0)
+                t_half = t[: len(t) // 2]
+                guided_eps = torch.where(
+                    ((t_half >= cfg_interval[0]) & (t_half <= cfg_interval[1])).view(
+                        -1, *[1] * (len(cond_eps.shape) - 1)
+                    ),
+                    uncond_eps + cfg_scale * (cond_eps - uncond_eps),
+                    cond_eps,
+                )
+                return torch.cat([torch.cat([guided_eps, guided_eps], dim=0), rest], dim=1)
 
             with amp.autocast("cuda", enabled=use_amp, dtype=amp_dtype):
-                zhat = sample_fn(z_noise, model.forward, cond=z_cond.to(amp_dtype if use_amp else torch.float32))[-1]
+                zhat = sample_fn(z, cfg_forward, cond=cond_combined)[-1][:bsz]
             samples = rae.decode(zhat.float()).clamp(0, 1)
 
             for i in range(samples.size(0)):
@@ -184,7 +222,7 @@ def main() -> None:
         prc=False,
     )
     fid_value = float(metrics["frechet_inception_distance"])
-    print(f"\n[result] FID (gaussian random cond, {generated} samples) = {fid_value:.4f}", flush=True)
+    print(f"\n[result] FID (gaussian random cond, cfg={args.cfg_scale:g}, {generated} samples) = {fid_value:.4f}", flush=True)
     print(f"[result] ckpt: {args.ckpt}", flush=True)
 
     if not args.keep_samples:

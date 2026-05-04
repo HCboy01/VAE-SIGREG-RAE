@@ -103,6 +103,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--resume", action="store_true")
     p.add_argument("--save-pair-grid", action="store_true")
     p.add_argument("--max-grid-pairs", type=int, default=32)
+    p.add_argument("--add-null", action="store_true", help="Add null_cond to image-derived z_cond before conditioning")
     return p.parse_args()
 
 
@@ -191,6 +192,8 @@ def main() -> None:
     cond_path = args.cond_path or args.real_path
     transform = transforms.Compose([CenterCropTransform(args.image_size), transforms.ToTensor()])
     cond_dataset = UnlabeledImageDataset(cond_path, transform=transform, return_path=True)
+    args.num_samples = min(args.num_samples, len(cond_dataset))
+    print(f"[info] num_samples capped to dataset size: {args.num_samples}", flush=True)
     cond_loader = DataLoader(
         cond_dataset,
         batch_size=args.batch_size,
@@ -258,6 +261,8 @@ def main() -> None:
                     images_cond = images_cond[:bsz]
                     cond_paths = list(cond_paths)[:bsz]
                     cond = conditioner(images_cond).float()
+                    if args.add_null:
+                        cond = cond + model.null_cond.expand(bsz, -1).to(device=cond.device, dtype=cond.dtype)
                     z0 = torch.randn(bsz, *latent_size, device=device, dtype=torch.float32)
                     if cfg_scale > 1.0:
                         z = torch.cat([z0, z0], dim=0)

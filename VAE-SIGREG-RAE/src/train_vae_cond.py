@@ -381,9 +381,9 @@ def main() -> None:
         print("[info] --resume set; skipping base stage2 checkpoint load", flush=True)
     model.train()
 
-    # freeze all except AdaLN + condition adapters
+    # freeze all except AdaLN + condition adapters, including the learned CFG null condition
     for name, p in model.named_parameters():
-        trainable = ("adaLN_modulation" in name) or ("cond_" in name)
+        trainable = ("adaLN_modulation" in name) or ("cond_" in name) or (name == "null_cond")
         p.requires_grad_(trainable)
 
     trainable_params = [p for p in model.parameters() if p.requires_grad]

@@ -3,3 +3,5 @@ __pycache__/
 ckpts/
 cache/
 logs/
+outputs/
+nohup.out
