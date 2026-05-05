@@ -7,7 +7,19 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
-set -a; source /root/workspace/hyeongchan/.env; set +a
+ENV_FILE="/root/workspace/.env"
+if [[ -f "$ENV_FILE" ]]; then
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        if [[ "$line" == *"="* ]]; then
+            key="${line%%=*}"
+            val="${line#*=}"
+            key="$(echo "$key" | xargs)"
+            val="$(echo "$val" | xargs)"
+            [[ -n "$key" ]] && export "$key=$val"
+        fi
+    done < "$ENV_FILE"
+fi
 
 export CUDA_VISIBLE_DEVICES=1
 
@@ -26,13 +38,16 @@ CMD="python train_run.py \
     --latent_dim 3072 \
     --num_layers 4 \
     --epochs 200 \
-    --batch_size 512 \
-    --accum_steps 4 \
+    --batch_size 2048 \
+    --accum_steps 1 \
     --lr 3e-4 \
     --warmup_epochs 5 \
     --beta_kl 1e-2 \
     --beta_kl_warmup_epochs 50 \
     --lambda_sigreg 0.05 \
+    --sigreg_type epps_pulley \
+    --sigreg_target z \
+    --ep_num_points 33 \
     --num_projections 3072 \
     --save_every 10 \
     --wandb_project vae-sigreg-sae \

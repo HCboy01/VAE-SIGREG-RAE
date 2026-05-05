@@ -17,7 +17,7 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, TensorDataset, random_split
 
-_ENV_PATH = Path("/root/workspace/hyeongchan/.env")
+_ENV_PATH = Path("/root/workspace/.env")
 if _ENV_PATH.exists():
     for line in _ENV_PATH.read_text().splitlines():
         line = line.strip()
@@ -29,11 +29,11 @@ import wandb
 
 from src.vae_sigreg import (
     OvercompleteVariationalAE,
+    build_sigreg_loss,
     compute_latent_diagnostics,
     kl_bottleneck_loss,
     reconstruction_loss,
     sample_from_prior,
-    sigreg_loss,
 )
 
 
@@ -97,6 +97,40 @@ def make_scheduler(optimizer, warmup_epochs, total_epochs, min_lr_ratio=0.01):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+@torch.no_grad()
+def latent_batch_metrics(mu: torch.Tensor, logvar: torch.Tensor, z: torch.Tensor) -> dict:
+    """Small aggregate-posterior health metrics for logging."""
+    z_f = z.float()
+    mu_f = mu.float()
+    logvar_f = logvar.float()
+    B, D = z_f.shape
+
+    z_mean_abs = z_f.mean(dim=0).abs().mean()
+    z_var_err = (z_f.var(dim=0, unbiased=False) - 1).abs().mean()
+
+    n_sub = min(64, D)
+    z_sub = z_f[:, :n_sub]
+    z_sub_c = z_sub - z_sub.mean(dim=0)
+    cov = z_sub_c.T @ z_sub_c / max(B - 1, 1)
+    off_mask = ~torch.eye(n_sub, dtype=torch.bool, device=z.device)
+    off_diag_cov = cov[off_mask].abs().mean()
+
+    kl_dim = 0.5 * (mu_f.pow(2) + logvar_f.exp() - logvar_f - 1).mean(dim=0)
+    active_units = (kl_dim > 0.01).sum()
+
+    return {
+        "latent_mean_error": z_mean_abs.item(),
+        "latent_variance_error": z_var_err.item(),
+        "covariance_offdiag_error": off_diag_cov.item(),
+        "active_units": active_units.item(),
+    }
+
+
+def threshold_tag(value: float) -> str:
+    """Make a stable metric suffix for activation thresholds."""
+    return f"{value:g}".replace("-", "m").replace(".", "_")
+
+
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
@@ -137,10 +171,32 @@ def parse_args():
     p.add_argument("--beta_kl_warmup_epochs",type=int,  default=30,  help="linearly ramp beta_kl from 0 over N epochs")
     p.add_argument("--lambda_sigreg",       type=float, default=0.1)
     p.add_argument("--num_projections",     type=int,   default=512)
+    p.add_argument("--sigreg_type", type=str, default="epps_pulley",
+                   choices=["epps_pulley", "moment", "none"])
+    p.add_argument("--sigreg_target", type=str, default="z", choices=["z", "mu"],
+                   help="Apply SIGReg to stochastic z or deterministic mu")
+    p.add_argument("--ep_num_points", type=int, default=33)
+    p.add_argument("--ep_t_min", type=float, default=-5.0)
+    p.add_argument("--ep_t_max", type=float, default=5.0)
+    p.add_argument("--ep_no_weight", action="store_true",
+                   help="Disable exp(-0.5*t^2) weighting in EP-SIGReg")
+    p.add_argument("--ep_slice_chunk_size", type=int, default=256)
 
-    # checkpointing
+    # checkpointing: keep only the best validation checkpoint to avoid quota blowups.
     p.add_argument("--ckpt_dir",   type=str, default="checkpoints")
     p.add_argument("--save_every", type=int, default=10)
+    p.add_argument("--best_metric", type=str, default="total_loss",
+                   choices=["total_loss", "active_safe_total", "active_units"],
+                   help="Checkpoint selection. active_safe_total keeps the best total among epochs above --min_active_units.")
+    p.add_argument("--min_active_units", type=float, default=0.0,
+                   help="Minimum val/active_units required when --best_metric=active_safe_total.")
+    p.add_argument("--dead_activation_threshold", type=float, default=0.1,
+                   help="A latent dimension is dead if it never exceeds this absolute activation over the validation set.")
+    p.add_argument("--dead_activation_thresholds", type=float, nargs="*",
+                   default=[0.1, 0.5],
+                   help="Thresholds logged for dead-neuron counting over the full validation set.")
+    p.add_argument("--dead_activation_target", type=str, default="mu", choices=["mu", "z"],
+                   help="Target used for dead-neuron counting. mu is deterministic; z includes sampling noise.")
     p.add_argument("--resume",       type=str, default=None, help="full resume: load model+optimizer+epoch")
     p.add_argument("--init_weights", type=str, default=None, help="load model weights only, train from epoch 1")
 
@@ -203,10 +259,20 @@ def main():
         betas=(0.9, 0.95),  # more aggressive momentum for large batch
     )
     scheduler = make_scheduler(optimizer, args.warmup_epochs, args.epochs)
+    sigreg_module = build_sigreg_loss(
+        sigreg_type=args.sigreg_type,
+        num_projections=args.num_projections,
+        ep_num_points=args.ep_num_points,
+        ep_t_min=args.ep_t_min,
+        ep_t_max=args.ep_t_max,
+        ep_weighted=not args.ep_no_weight,
+        ep_slice_chunk_size=args.ep_slice_chunk_size,
+    )
 
     # --- Resume / Init ---
     start_epoch = 1
     best_val_total = float("inf")
+    best_active_units = -float("inf")
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
@@ -254,7 +320,8 @@ def main():
                 out = model(x)
                 rec  = reconstruction_loss(out["x_hat"], x)
                 kl   = kl_bottleneck_loss(out["mu"], out["logvar"])
-                sig  = sigreg_loss(out["z"], num_projections=args.num_projections)
+                sig_target = out[args.sigreg_target]
+                sig  = sigreg_module(sig_target)
                 loss = (rec + beta_kl_now * kl + args.lambda_sigreg * sig) / args.accum_steps
 
             loss.backward()
@@ -266,13 +333,17 @@ def main():
 
             # accumulate (unscaled) metrics
             s = args.accum_steps
+            batch_health = latent_batch_metrics(out["mu"], out["logvar"], out["z"])
             for k, v in [
                 ("rec_loss", rec), ("kl_loss", kl), ("sigreg_loss", sig),
+                ("ep_sigreg_loss", sig if args.sigreg_type == "epps_pulley" else sig.detach() * 0.0),
                 ("total_loss", rec + beta_kl_now * kl + args.lambda_sigreg * sig),
                 ("mu_sq_mean", out["mu"].pow(2).mean().detach()),
                 ("exp_logvar_mean", out["logvar"].exp().mean().detach()),
             ]:
                 train_acc[k] = train_acc.get(k, 0.0) + v.item()
+            for k, v in batch_health.items():
+                train_acc[k] = train_acc.get(k, 0.0) + float(v)
             n_train += 1
 
         train_metrics = {k: v / n_train for k, v in train_acc.items()}
@@ -282,6 +353,8 @@ def main():
         model.eval()
         val_acc = {}
         n_val = 0
+        dead_thresholds = sorted(set(args.dead_activation_thresholds + [args.dead_activation_threshold]))
+        ever_active_masks = {thr: None for thr in dead_thresholds}
         with torch.no_grad():
             for (x,) in val_loader:
                 x = x.to(device)
@@ -289,18 +362,51 @@ def main():
                     out = model(x)
                     rec = reconstruction_loss(out["x_hat"], x)
                     kl  = kl_bottleneck_loss(out["mu"], out["logvar"])
-                    sig = sigreg_loss(out["z"], num_projections=args.num_projections)
+                    sig = sigreg_module(out[args.sigreg_target])
 
+                batch_health = latent_batch_metrics(out["mu"], out["logvar"], out["z"])
                 for k, v in [
                     ("rec_loss", rec), ("kl_loss", kl), ("sigreg_loss", sig),
+                    ("ep_sigreg_loss", sig if args.sigreg_type == "epps_pulley" else sig * 0.0),
                     ("total_loss", rec + beta_kl_now * kl + args.lambda_sigreg * sig),
                     ("mu_sq_mean", out["mu"].pow(2).mean()),
                     ("exp_logvar_mean", out["logvar"].exp().mean()),
                 ]:
                     val_acc[k] = val_acc.get(k, 0.0) + v.item()
+                for k, v in batch_health.items():
+                    val_acc[k] = val_acc.get(k, 0.0) + float(v)
                 n_val += 1
 
+                dead_target = out[args.dead_activation_target].float()
+                dead_target_abs = dead_target.abs()
+                for thr in dead_thresholds:
+                    batch_active = dead_target_abs.gt(thr).any(dim=0)
+                    prev = ever_active_masks[thr]
+                    ever_active_masks[thr] = batch_active if prev is None else (prev | batch_active)
+
         val_metrics = {k: v / n_val for k, v in val_acc.items()}
+        primary_dead_metrics = None
+        for thr, mask in ever_active_masks.items():
+            if mask is None:
+                continue
+            ever_active_units = mask.sum().item()
+            dead_units = mask.numel() - ever_active_units
+            tag = threshold_tag(thr)
+            metrics = {
+                "ever_active_units": float(ever_active_units),
+                "dead_units": float(dead_units),
+                "dead_fraction": float(dead_units / max(1, mask.numel())),
+            }
+            val_metrics[f"ever_active_units_thr_{tag}"] = metrics["ever_active_units"]
+            val_metrics[f"dead_units_thr_{tag}"] = metrics["dead_units"]
+            val_metrics[f"dead_fraction_thr_{tag}"] = metrics["dead_fraction"]
+            if abs(thr - args.dead_activation_threshold) < 1e-12:
+                primary_dead_metrics = metrics
+        if primary_dead_metrics is not None:
+            val_metrics["ever_active_units"] = primary_dead_metrics["ever_active_units"]
+            val_metrics["dead_units"] = primary_dead_metrics["dead_units"]
+            val_metrics["dead_fraction"] = primary_dead_metrics["dead_fraction"]
+            val_metrics["active_units_kl_0_01"] = val_metrics.get("active_units", 0.0)
 
         # ---- Latent diagnostics (one val batch) ----
         with torch.no_grad():
@@ -333,6 +439,14 @@ def main():
             "val/z_mean_abs": z_mean_abs,
             "val/z_var_err": z_var_err,
             "val/z_off_diag_cov": off_diag_cov,
+            "val/latent_mean_error": val_metrics.get("latent_mean_error", z_mean_abs),
+            "val/latent_variance_error": val_metrics.get("latent_variance_error", z_var_err),
+            "val/covariance_offdiag_error": val_metrics.get("covariance_offdiag_error", off_diag_cov),
+            "val/active_units": val_metrics.get("active_units", 0.0),
+            "val/ever_active_units": val_metrics.get("ever_active_units", 0.0),
+            "val/dead_units": val_metrics.get("dead_units", 0.0),
+            "val/dead_fraction": val_metrics.get("dead_fraction", 0.0),
+            "val/active_units_kl_0_01": val_metrics.get("active_units_kl_0_01", val_metrics.get("active_units", 0.0)),
             **{f"diag/{k}": v for k, v in diag.items()},
             "epoch_time_sec": elapsed,
         }
@@ -345,23 +459,29 @@ def main():
             f"kl={val_metrics['kl_loss']:.1f}  "
             f"sig={val_metrics['sigreg_loss']:.4f}  "
             f"total={val_metrics['total_loss']:.4f}  "
+            f"ever_active={val_metrics.get('ever_active_units', 0.0):.1f}  "
+            f"dead={val_metrics.get('dead_units', 0.0):.1f}  "
+            f"kl_active={val_metrics.get('active_units', 0.0):.1f}  "
+            f"var={val_metrics.get('latent_variance_error', z_var_err):.4f}  "
+            f"offdiag={val_metrics.get('covariance_offdiag_error', off_diag_cov):.4f}  "
             f"({elapsed:.1f}s)"
         )
 
         # ---- Checkpoint ----
-        is_best = val_metrics["total_loss"] < best_val_total
+        active_now = val_metrics.get("ever_active_units", val_metrics.get("active_units", 0.0))
+        if args.best_metric == "active_units":
+            is_best = active_now > best_active_units
+        elif args.best_metric == "active_safe_total":
+            is_best = active_now >= args.min_active_units and val_metrics["total_loss"] < best_val_total
+        else:
+            is_best = val_metrics["total_loss"] < best_val_total
         if is_best:
             best_val_total = val_metrics["total_loss"]
+            best_active_units = active_now
             torch.save(
                 {"epoch": epoch, "model": model.state_dict(),
                  "optimizer": optimizer.state_dict(), "args": vars(args)},
                 ckpt_dir / "best.pt",
-            )
-        if epoch % args.save_every == 0:
-            torch.save(
-                {"epoch": epoch, "model": model.state_dict(),
-                 "optimizer": optimizer.state_dict(), "args": vars(args)},
-                ckpt_dir / f"epoch_{epoch:04d}.pt",
             )
 
     samples = sample_from_prior(model, 8, args.latent_dim, device)

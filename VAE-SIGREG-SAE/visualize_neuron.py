@@ -11,6 +11,7 @@ Outputs one PNG per neuron (10 total).
 """
 
 import argparse
+import io
 import sys
 from pathlib import Path
 
@@ -49,8 +50,59 @@ def encode_all(model, embeddings, device, batch_size=1024):
     return torch.cat(mus), torch.cat(lvs)
 
 
+def parse_path_line(line, image_root=None):
+    """Accept absolute paths, relative paths, or index<TAB>filename manifests."""
+    parts = line.strip().split()
+    path = parts[-1] if parts else ""
+    p = Path(path)
+    if not p.is_absolute() and image_root:
+        p = Path(image_root) / p
+    return str(p)
+
+
+def parse_path_entry(line, image_root=None):
+    """Return (dataset_index, resolved_path) from a manifest line."""
+    parts = line.strip().split()
+    idx = int(parts[0]) if parts and parts[0].isdigit() else None
+    path = parts[-1] if parts else ""
+    p = Path(path)
+    if not p.is_absolute() and image_root:
+        p = Path(image_root) / p
+    return idx, str(p)
+
+
 def load_image(path, size):
     return Image.open(path).convert("RGB").resize((size, size), Image.LANCZOS)
+
+
+class ParquetImageStore:
+    """Lazy FFHQ parquet image loader for HuggingFace image-byte shards."""
+
+    def __init__(self, parquet_root):
+        self.files = sorted(Path(parquet_root).glob("*.parquet"))
+        if not self.files:
+            raise FileNotFoundError(f"No parquet files found in {parquet_root}")
+        self.shard_size = None
+        self.cache = {}
+
+    def _locate(self, index):
+        if self.shard_size is None:
+            import pandas as pd
+            self.shard_size = len(pd.read_parquet(self.files[0], columns=[]))
+        shard = index // self.shard_size
+        row = index % self.shard_size
+        if shard >= len(self.files):
+            raise IndexError(f"Index {index} exceeds {len(self.files)} parquet shards")
+        return shard, row
+
+    def load(self, index, size):
+        import pandas as pd
+        shard, row = self._locate(index)
+        if shard not in self.cache:
+            self.cache[shard] = pd.read_parquet(self.files[shard], columns=["image"])
+        item = self.cache[shard].iloc[row]["image"]
+        data = item["bytes"] if isinstance(item, dict) else item
+        return Image.open(io.BytesIO(data)).convert("RGB").resize((size, size), Image.LANCZOS)
 
 
 def annotate(img, line1, line2=""):
@@ -83,9 +135,18 @@ def main():
     p.add_argument("--ckpt",       default="checkpoints/best.pt")
     p.add_argument("--embeddings", default="/workspace/hyeongchan/datasets/ffhq256/dino_cls_features/train_features.bin")
     p.add_argument("--paths",      default="/workspace/hyeongchan/datasets/ffhq256/dino_cls_features/train_paths.txt")
+    p.add_argument("--image_root", default=None,
+                   help="Optional root directory for relative filenames in --paths")
+    p.add_argument("--parquet_root", default=None,
+                   help="Optional directory containing FFHQ parquet shards with an image bytes column")
     p.add_argument("--n_neurons",  type=int, default=10,   help="How many neurons to visualize")
     p.add_argument("--n_images",   type=int, default=16,   help="Images per neuron (shown as grid)")
     p.add_argument("--img_size",   type=int, default=128)
+    p.add_argument("--padding",    type=int, default=4)
+    p.add_argument("--grid_bg",    type=int, default=160,
+                   help="Grid background grayscale value, e.g. 255 for white")
+    p.add_argument("--no_annotations", action="store_true",
+                   help="Save clean image grids without mu/var/KL text overlays")
     p.add_argument("--output_dir", default="visualizations/neurons")
     p.add_argument("--neuron_ids", type=int, nargs="*", default=None,
                    help="Manually specify neuron indices. If omitted, auto-selects top-N.")
@@ -103,7 +164,10 @@ def main():
     embeddings = torch.from_numpy(
         np.fromfile(args.embeddings, dtype=np.float32).reshape(shape)
     )
-    paths = [ln.strip() for ln in open(args.paths)]
+    entries = [parse_path_entry(ln, args.image_root) for ln in open(args.paths)]
+    indices = [idx for idx, _ in entries]
+    paths = [path for _, path in entries]
+    parquet_store = ParquetImageStore(args.parquet_root) if args.parquet_root else None
     print(f"Embeddings: {embeddings.shape}  paths: {len(paths)}")
 
     # Encode → mu, logvar
@@ -149,17 +213,21 @@ def main():
 
         pos_imgs, neg_imgs = [], []
         for i in pos_idx:
-            img = load_image(paths[i], args.img_size)
-            l1 = f"mu=+{mu_j[i]:.3f}"
-            l2 = f"var={var_j[i]:.3f} kl={dev_j[i]:.3f}"
-            pos_imgs.append(annotate(img, l1, l2))
+            img = parquet_store.load(indices[i], args.img_size) if parquet_store else load_image(paths[i], args.img_size)
+            if not args.no_annotations:
+                l1 = f"mu=+{mu_j[i]:.3f}"
+                l2 = f"var={var_j[i]:.3f} kl={dev_j[i]:.3f}"
+                img = annotate(img, l1, l2)
+            pos_imgs.append(img)
         for i in neg_idx:
-            img = load_image(paths[i], args.img_size)
-            l1 = f"mu={mu_j[i]:.3f}"
-            l2 = f"var={var_j[i]:.3f} kl={dev_j[i]:.3f}"
-            neg_imgs.append(annotate(img, l1, l2))
+            img = parquet_store.load(indices[i], args.img_size) if parquet_store else load_image(paths[i], args.img_size)
+            if not args.no_annotations:
+                l1 = f"mu={mu_j[i]:.3f}"
+                l2 = f"var={var_j[i]:.3f} kl={dev_j[i]:.3f}"
+                img = annotate(img, l1, l2)
+            neg_imgs.append(img)
 
-        grid = make_grid(pos_imgs + neg_imgs, nrow=n_half)
+        grid = make_grid(pos_imgs + neg_imgs, nrow=n_half, padding=args.padding, bg=args.grid_bg)
         fname = out_dir / f"rank{rank:02d}_neuron{j}_kl{dev_j.max():.3f}.png"
         grid.save(str(fname))
 
