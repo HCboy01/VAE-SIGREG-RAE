@@ -23,6 +23,86 @@ def kl_bottleneck_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return kl_per_sample.mean()
 
 
+def kl_feature_level(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """
+    Per-feature batch moment matching: for each dim d, match the batch-level
+    distribution of mu and sigma to N(0,1) using squared L2 penalty.
+
+      mean_penalty_d = ( E_n[mu[n,d]] )^2          → batch mean mu should be 0
+      var_penalty_d  = ( E_n[sigma[n,d]^2] - 1 )^2 → batch mean sigma^2 should be 1
+
+    loss = sum_d ( mean_penalty_d + var_penalty_d )
+
+    Why this is better than kl_bottleneck for selectivity:
+      - kl_bottleneck gradient w.r.t. mu[n,d] = beta * mu[n,d]
+        → large mu (informative) gets large gradient → always fighting reconstruction
+      - this gradient w.r.t. mu[n,d] = 2 * mu_mean_d / B
+        → gradient is the SAME for all samples, scaled by the batch mean
+        → selective feature (mu large for few images): mu_mean_d is small
+          → gradient is small → reconstruction can dominate → feature stays active
+        → always-on feature (mu nonzero for all images): mu_mean_d is large
+          → gradient is large → penalised
+    """
+    mu_mean    = mu.mean(dim=0)             # [D]
+    sigma2_mean = logvar.exp().mean(dim=0)  # [D]
+
+    mean_penalty = mu_mean.pow(2)           # [D]
+    var_penalty  = (sigma2_mean - 1).pow(2) # [D]
+
+    return (mean_penalty + var_penalty).sum()
+
+
+def kl_feature_level_log(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """
+    Decomposed sparsity-inducing KL: log penalty on mu, direct KL on sigma.
+
+      mu_term    = sum_d log(1 + mean_n[mu[n,d]²])
+                   → sparsity: active dims saturate, gradient ∝ 1/(1+mean_mu²)
+      sigma_term = sum_d mean_n[sigma[n,d]² - log(sigma[n,d]²) - 1]
+                   → sigma stays in (0,∞): -log term → ∞ as sigma→0 (prevents collapse)
+                                           sigma² term → ∞ as sigma→∞ (prevents >1)
+
+    Keeping sigma OUTSIDE the log prevents saturation that caused sigma→0 in the
+    previous (combined) version.
+    """
+    mu2_mean      = mu.pow(2).mean(dim=0)                   # [D], ≥0
+    kl_sigma_mean = (logvar.exp() - logvar - 1).mean(dim=0) # [D], ≥0
+    return torch.log1p(mu2_mean).sum() + kl_sigma_mean.sum()
+
+
+def l1_mu_loss(mu: torch.Tensor) -> torch.Tensor:
+    """
+    L1 penalty on encoder mean: mean_N mean_D |mu_{n,d}|.
+
+    Adds a Laplace prior on mu alongside the Gaussian prior from KL.
+    Unlike KL's gradient ∝ mu (small mu → small gradient), the L1 gradient is
+    ±alpha (constant magnitude), so near-zero dims get pushed harder toward
+    exactly 0, sharpening sparsity.
+    """
+    return mu.abs().mean()
+
+
+def kl_feature_level_sq(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+    """
+    Per-dim squared mean-KL loss.
+
+    For each dim d:
+      f_d = mean_n[mu[n,d]²] + mean_n[sigma[n,d]² - log(sigma[n,d]²) - 1]
+          = 2 * mean_n[ KL(q(z_d|x_n) || N(0,1)) ]
+
+    loss = sum_d( f_d² )
+
+    Gradient w.r.t. mu[n,d] ∝ mean_n[KL_d] * mu[n,d]:
+      - inactive dim (mean KL ≈ 0): gradient ≈ 0 → reconstruction dominates → feature survives
+      - always-on dim (mean KL large): gradient large → pushed to prior
+    No sign-cancellation: mu² ≥ 0 and sigma²-log(sigma²)-1 ≥ 0 for all inputs.
+    """
+    mu2_mean      = mu.pow(2).mean(dim=0)                          # [D]
+    kl_sigma_mean = (logvar.exp() - logvar - 1).mean(dim=0)        # [D]
+    per_dim       = mu2_mean + kl_sigma_mean                       # [D], = 2*mean_n[KL_{n,d}]
+    return per_dim.pow(2).sum()
+
+
 class MomentSIGRegLoss(nn.Module):
     """Sliced moment-matching SIGReg kept for ablations."""
 

@@ -16,9 +16,11 @@ class OvercompleteVariationalAE(nn.Module):
     """
     Overcomplete VAE: latent_dim may be larger than input_dim.
 
-    Encoder maps x -> (mu, logvar) in latent space.
-    Decoder maps z -> x_hat in input space.
-    Both use symmetric MLP with LayerNorm + GELU.
+    Encoder maps x -> (mu, logvar) via MLP with LayerNorm + GELU.
+    Decoder maps z -> x_hat. When linear_decoder=True (default), decoder is a
+    single affine layer z -> x_hat, which prevents dead features by ensuring
+    every latent dimension receives reconstruction gradients directly.
+    When linear_decoder=False, decoder uses the same MLP structure as before.
 
     hidden_dim defaults to input_dim * 4 (e.g. 768 -> 3072).
     """
@@ -29,6 +31,7 @@ class OvercompleteVariationalAE(nn.Module):
         latent_dim: int,
         hidden_dim: Optional[int] = None,
         num_layers: int = 2,
+        linear_decoder: bool = True,
     ):
         super().__init__()
         if hidden_dim is None:
@@ -47,14 +50,17 @@ class OvercompleteVariationalAE(nn.Module):
         self.mu_head = nn.Linear(hidden_dim, latent_dim)
         self.logvar_head = nn.Linear(hidden_dim, latent_dim)
 
-        # --- Decoder: latent_dim -> hidden_dim (x num_layers) -> input_dim ---
-        dec_layers: list[nn.Module] = []
-        dec_in = latent_dim
-        for _ in range(num_layers):
-            dec_layers.append(_make_mlp_block(dec_in, hidden_dim))
-            dec_in = hidden_dim
-        dec_layers.append(nn.Linear(hidden_dim, input_dim))
-        self.decoder = nn.Sequential(*dec_layers)
+        # --- Decoder ---
+        if linear_decoder:
+            self.decoder = nn.Linear(latent_dim, input_dim)
+        else:
+            dec_layers: list[nn.Module] = []
+            dec_in = latent_dim
+            for _ in range(num_layers):
+                dec_layers.append(_make_mlp_block(dec_in, hidden_dim))
+                dec_in = hidden_dim
+            dec_layers.append(nn.Linear(hidden_dim, input_dim))
+            self.decoder = nn.Sequential(*dec_layers)
 
     def encode(self, x: torch.Tensor):
         h = self.encoder_backbone(x)

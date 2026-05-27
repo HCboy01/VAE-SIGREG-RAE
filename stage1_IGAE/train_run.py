@@ -30,8 +30,16 @@ import wandb
 from src.vae_sigreg import (
     OvercompleteVariationalAE,
     build_sigreg_loss,
+    compute_kl_active_dims,
     compute_latent_diagnostics,
+    compute_marginal_moments,
+    compute_selective_activity,
+    compute_z_frechet_distance,
     kl_bottleneck_loss,
+    kl_feature_level,
+    kl_feature_level_log,
+    kl_feature_level_sq,
+    l1_mu_loss,
     reconstruction_loss,
     sample_from_prior,
 )
@@ -152,6 +160,10 @@ def parse_args():
     p.add_argument("--latent_dim", type=int,   default=6144)
     p.add_argument("--hidden_dim", type=int,   default=None)
     p.add_argument("--num_layers", type=int,   default=4)
+    p.add_argument("--linear_decoder", action="store_true", default=True,
+                   help="use single linear layer as decoder (default: True)")
+    p.add_argument("--no_linear_decoder", dest="linear_decoder", action="store_false",
+                   help="use MLP decoder instead of linear")
 
     # training
     p.add_argument("--epochs",      type=int,   default=200)
@@ -169,12 +181,24 @@ def parse_args():
     # loss weights
     p.add_argument("--beta_kl",             type=float, default=1e-3)
     p.add_argument("--beta_kl_warmup_epochs",type=int,  default=30,  help="linearly ramp beta_kl from 0 over N epochs")
+    p.add_argument("--kl_type", type=str, default="sample",
+                   choices=["sample", "feature", "feature_sq", "feature_log", "sample_l1"],
+                   help="sample: standard per-image KL (default). "
+                        "feature: marginal KL per dim — penalises always-on dims directly. "
+                        "feature_sq: sum_d(mean_n[KL_d])^2 — no cancellation, gradient proportional to mean KL. "
+                        "feature_log: sum_d log(1+mean_n[KL_d]) — sparsity-inducing, gradient saturates for active dims. "
+                        "sample_l1: standard KL + alpha_l1 * mean|mu| — Laplace prior sharpens sparsity.")
+    p.add_argument("--alpha_l1",            type=float, default=0.0,
+                   help="weight for L1 penalty on |mu| (only used when kl_type=sample_l1)")
     p.add_argument("--lambda_sigreg",       type=float, default=0.1)
     p.add_argument("--num_projections",     type=int,   default=512)
     p.add_argument("--sigreg_type", type=str, default="epps_pulley",
                    choices=["epps_pulley", "moment", "none"])
-    p.add_argument("--sigreg_target", type=str, default="z", choices=["z", "mu"],
-                   help="Apply SIGReg to stochastic z or deterministic mu")
+    p.add_argument("--sigreg_target", type=str, default="z", choices=["z", "mu", "mu_feat"],
+                   help="z/mu: image-axis SIGReg (B samples in D-space). "
+                        "mu_feat: feature-axis SIGReg — transposes mu to [D, B], "
+                        "treating D=6144 features as samples and pushing each "
+                        "feature's distribution across images toward N(0,1).")
     p.add_argument("--ep_num_points", type=int, default=33)
     p.add_argument("--ep_t_min", type=float, default=-5.0)
     p.add_argument("--ep_t_max", type=float, default=5.0)
@@ -185,11 +209,6 @@ def parse_args():
     # checkpointing: keep only the best validation checkpoint to avoid quota blowups.
     p.add_argument("--ckpt_dir",   type=str, default="checkpoints")
     p.add_argument("--save_every", type=int, default=10)
-    p.add_argument("--best_metric", type=str, default="total_loss",
-                   choices=["total_loss", "active_safe_total", "active_units"],
-                   help="Checkpoint selection. active_safe_total keeps the best total among epochs above --min_active_units.")
-    p.add_argument("--min_active_units", type=float, default=0.0,
-                   help="Minimum val/active_units required when --best_metric=active_safe_total.")
     p.add_argument("--dead_activation_threshold", type=float, default=0.1,
                    help="A latent dimension is dead if it never exceeds this absolute activation over the validation set.")
     p.add_argument("--dead_activation_thresholds", type=float, nargs="*",
@@ -250,6 +269,7 @@ def main():
         latent_dim=args.latent_dim,
         hidden_dim=args.hidden_dim,
         num_layers=args.num_layers,
+        linear_decoder=args.linear_decoder,
     ).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {n_params:,}")
@@ -272,7 +292,6 @@ def main():
     # --- Resume / Init ---
     start_epoch = 1
     best_val_total = float("inf")
-    best_active_units = -float("inf")
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt["model"])
@@ -319,8 +338,20 @@ def main():
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 out = model(x)
                 rec  = reconstruction_loss(out["x_hat"], x)
-                kl   = kl_bottleneck_loss(out["mu"], out["logvar"])
-                sig_target = out[args.sigreg_target]
+                if args.kl_type == "sample_l1":
+                    kl_base = kl_bottleneck_loss(out["mu"], out["logvar"])
+                    l1_mu   = l1_mu_loss(out["mu"])
+                    kl      = kl_base + args.alpha_l1 * l1_mu
+                else:
+                    _kl_fn = {"feature": kl_feature_level, "feature_sq": kl_feature_level_sq,
+                              "feature_log": kl_feature_level_log}.get(args.kl_type, kl_bottleneck_loss)
+                    kl    = _kl_fn(out["mu"], out["logvar"])
+                    kl_base = kl
+                    l1_mu   = out["mu"].new_zeros(())
+                if args.sigreg_target == "mu_feat":
+                    sig_target = out["mu"].T   # [D, B]: feature-axis
+                else:
+                    sig_target = out[args.sigreg_target]
                 sig  = sigreg_module(sig_target)
                 loss = (rec + beta_kl_now * kl + args.lambda_sigreg * sig) / args.accum_steps
 
@@ -334,12 +365,16 @@ def main():
             # accumulate (unscaled) metrics
             s = args.accum_steps
             batch_health = latent_batch_metrics(out["mu"], out["logvar"], out["z"])
+            _mu_batch_mean_abs = out["mu"].detach().mean(dim=0).abs().mean()
             for k, v in [
-                ("rec_loss", rec), ("kl_loss", kl), ("sigreg_loss", sig),
+                ("rec_loss", rec), ("kl_loss", kl), ("kl_base_loss", kl_base),
+                ("l1_mu_loss", l1_mu),
+                ("sigreg_loss", sig),
                 ("ep_sigreg_loss", sig if args.sigreg_type == "epps_pulley" else sig.detach() * 0.0),
                 ("total_loss", rec + beta_kl_now * kl + args.lambda_sigreg * sig),
                 ("mu_sq_mean", out["mu"].pow(2).mean().detach()),
                 ("exp_logvar_mean", out["logvar"].exp().mean().detach()),
+                ("mu_batch_mean_abs", _mu_batch_mean_abs),
             ]:
                 train_acc[k] = train_acc.get(k, 0.0) + v.item()
             for k, v in batch_health.items():
@@ -355,18 +390,37 @@ def main():
         n_val = 0
         dead_thresholds = sorted(set(args.dead_activation_thresholds + [args.dead_activation_threshold]))
         ever_active_masks = {thr: None for thr in dead_thresholds}
+        # per-image KL selectivity accumulators
+        sel_feat_counts = {thr: None for thr in dead_thresholds}  # [D] sum over images
+        sel_img_lists   = {thr: [] for thr in dead_thresholds}    # list of [B] tensors
+        sel_total_imgs  = 0
         with torch.no_grad():
             for (x,) in val_loader:
                 x = x.to(device)
                 with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     out = model(x)
                     rec = reconstruction_loss(out["x_hat"], x)
-                    kl  = kl_bottleneck_loss(out["mu"], out["logvar"])
-                    sig = sigreg_module(out[args.sigreg_target])
+                    if args.kl_type == "sample_l1":
+                        kl_base_v = kl_bottleneck_loss(out["mu"], out["logvar"])
+                        l1_mu_v   = l1_mu_loss(out["mu"])
+                        kl        = kl_base_v + args.alpha_l1 * l1_mu_v
+                    else:
+                        _kl_fn = {"feature": kl_feature_level, "feature_sq": kl_feature_level_sq,
+                                  "feature_log": kl_feature_level_log}.get(args.kl_type, kl_bottleneck_loss)
+                        kl        = _kl_fn(out["mu"], out["logvar"])
+                        kl_base_v = kl
+                        l1_mu_v   = out["mu"].new_zeros(())
+                    if args.sigreg_target == "mu_feat":
+                        sig = sigreg_module(out["mu"].T)
+                    else:
+                        sig = sigreg_module(out[args.sigreg_target])
 
+                kl_sample = kl_bottleneck_loss(out["mu"], out["logvar"])
                 batch_health = latent_batch_metrics(out["mu"], out["logvar"], out["z"])
                 for k, v in [
-                    ("rec_loss", rec), ("kl_loss", kl), ("sigreg_loss", sig),
+                    ("rec_loss", rec), ("kl_loss", kl), ("kl_base_loss", kl_base_v),
+                    ("l1_mu_loss", l1_mu_v), ("kl_sample_loss", kl_sample),
+                    ("sigreg_loss", sig),
                     ("ep_sigreg_loss", sig if args.sigreg_type == "epps_pulley" else sig * 0.0),
                     ("total_loss", rec + beta_kl_now * kl + args.lambda_sigreg * sig),
                     ("mu_sq_mean", out["mu"].pow(2).mean()),
@@ -384,7 +438,31 @@ def main():
                     prev = ever_active_masks[thr]
                     ever_active_masks[thr] = batch_active if prev is None else (prev | batch_active)
 
+                # per-image KL activity: kl_ij = 0.5*(mu_ij^2 + exp(logvar_ij) - logvar_ij - 1)
+                mu_f = out["mu"].float()
+                lv_f = out["logvar"].float()
+                kl_per_img = 0.5 * (mu_f.pow(2) + lv_f.exp() - lv_f - 1)  # [B, D]
+                for thr in dead_thresholds:
+                    active_mask = kl_per_img.gt(thr)                        # [B, D] bool
+                    feat_sum = active_mask.sum(0).float().cpu()              # [D]
+                    img_sum  = active_mask.sum(1).float().cpu()              # [B]
+                    sel_feat_counts[thr] = feat_sum if sel_feat_counts[thr] is None \
+                                           else sel_feat_counts[thr] + feat_sum
+                    sel_img_lists[thr].append(img_sum)
+                sel_total_imgs += mu_f.shape[0]
+
         val_metrics = {k: v / n_val for k, v in val_acc.items()}
+
+        # selective activity metrics (per-image KL threshold)
+        for thr in dead_thresholds:
+            if sel_feat_counts[thr] is not None and sel_total_imgs > 0:
+                feat_freq   = sel_feat_counts[thr] / sel_total_imgs
+                img_counts  = torch.cat(sel_img_lists[thr])
+                sel_metrics = compute_selective_activity(
+                    feat_freq, img_counts, thr, latent_dim=args.latent_dim
+                )
+                val_metrics.update(sel_metrics)
+
         primary_dead_metrics = None
         for thr, mask in ever_active_masks.items():
             if mask is None:
@@ -448,41 +526,158 @@ def main():
             "val/dead_fraction": val_metrics.get("dead_fraction", 0.0),
             "val/active_units_kl_0_01": val_metrics.get("active_units_kl_0_01", val_metrics.get("active_units", 0.0)),
             **{f"diag/{k}": v for k, v in diag.items()},
+            # selective activity (primary threshold)
+            **{k: v for k, v in val_metrics.items() if k.startswith("sel/")},
             "epoch_time_sec": elapsed,
         }
         wandb.log(log, step=epoch)
 
+        # pick primary threshold tag for print
+        _ptag = f"{args.dead_activation_threshold:g}".replace(".", "_").replace("-", "m")
         print(
             f"[{epoch:04d}/{args.epochs}] "
             f"lr={lr_now:.2e}  β={beta_kl_now:.2e}  "
             f"rec={val_metrics['rec_loss']:.4f}  "
             f"kl={val_metrics['kl_loss']:.1f}  "
+            f"kl_s={val_metrics.get('kl_sample_loss', float('nan')):.2f}  "
             f"sig={val_metrics['sigreg_loss']:.4f}  "
             f"total={val_metrics['total_loss']:.4f}  "
-            f"ever_active={val_metrics.get('ever_active_units', 0.0):.1f}  "
-            f"dead={val_metrics.get('dead_units', 0.0):.1f}  "
-            f"kl_active={val_metrics.get('active_units', 0.0):.1f}  "
-            f"var={val_metrics.get('latent_variance_error', z_var_err):.4f}  "
-            f"offdiag={val_metrics.get('covariance_offdiag_error', off_diag_cov):.4f}  "
+            f"dead={val_metrics.get(f'sel/feat_never_active_{_ptag}', float('nan')):.3f}  "
+            f"always={val_metrics.get(f'sel/feat_always_active_{_ptag}', float('nan')):.3f}  "
+            f"img_frac={val_metrics.get(f'sel/img_active_frac_{_ptag}', float('nan')):.3f}  "
+            f"freq_p50={val_metrics.get(f'sel/feat_freq_p50_{_ptag}', float('nan')):.3f}  "
             f"({elapsed:.1f}s)"
         )
 
         # ---- Checkpoint ----
-        active_now = val_metrics.get("ever_active_units", val_metrics.get("active_units", 0.0))
-        if args.best_metric == "active_units":
-            is_best = active_now > best_active_units
-        elif args.best_metric == "active_safe_total":
-            is_best = active_now >= args.min_active_units and val_metrics["total_loss"] < best_val_total
-        else:
-            is_best = val_metrics["total_loss"] < best_val_total
+        is_best = val_metrics["total_loss"] < best_val_total
         if is_best:
             best_val_total = val_metrics["total_loss"]
-            best_active_units = active_now
             torch.save(
                 {"epoch": epoch, "model": model.state_dict(),
                  "optimizer": optimizer.state_dict(), "args": vars(args)},
                 ckpt_dir / "best.pt",
             )
+
+    # always save final epoch
+    torch.save(
+        {"epoch": epoch, "model": model.state_dict(),
+         "optimizer": optimizer.state_dict(), "args": vars(args)},
+        ckpt_dir / "last.pt",
+    )
+
+    # ------------------------------------------------------------------ #
+    # End-of-training diagnostics: collect full val set, run full suite  #
+    # ------------------------------------------------------------------ #
+    print("\n[eot] collecting full val-set diagnostics...", flush=True)
+    _all_z, _all_mu, _all_lgv = [], [], []
+    model.eval()
+    with torch.no_grad():
+        for (x,) in val_loader:
+            x = x.to(device)
+            with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
+                out = model(x)
+            _all_z.append(out["z"].float().cpu())
+            _all_mu.append(out["mu"].float().cpu())
+            _all_lgv.append(out["logvar"].float().cpu())
+
+    _z_all  = torch.cat(_all_z,  dim=0).to(device)
+    _mu_all = torch.cat(_all_mu, dim=0).to(device)
+    _lgv_all= torch.cat(_all_lgv,dim=0).to(device)
+
+    _fd   = compute_z_frechet_distance(_z_all)
+    _kl   = compute_kl_active_dims(_mu_all, _lgv_all, thresholds=(0.1, 0.5, 1.0))
+    _mom  = compute_marginal_moments(_z_all)
+
+    # selective activity on full val set
+    _eot_sel: dict = {}
+    _eot_sel_lines: list[str] = []
+    for _thr in [0.1, 0.5, 1.0]:
+        _kl_per_img = 0.5 * (_mu_all.pow(2) + _lgv_all.exp() - _lgv_all - 1)  # [N, D]
+        _active     = _kl_per_img.gt(_thr)
+        _feat_freq  = _active.float().mean(0).cpu()   # [D]
+        _img_counts = _active.float().sum(1).cpu()    # [N]
+        _sm = compute_selective_activity(_feat_freq, _img_counts, _thr, args.latent_dim)
+        _eot_sel.update(_sm)
+        _tag = f"{_thr:g}".replace(".", "_").replace("-", "m")
+        _eot_sel_lines += [
+            f"  threshold={_thr}",
+            f"    feat_never_active  = {_sm[f'sel/feat_never_active_{_tag}']:.4f}  (dead; target→0)",
+            f"    feat_always_active = {_sm[f'sel/feat_always_active_{_tag}']:.4f}  (saturated; target→0)",
+            f"    feat_freq_p10/p50/p90 = "
+            f"{_sm[f'sel/feat_freq_p10_{_tag}']:.3f} / "
+            f"{_sm[f'sel/feat_freq_p50_{_tag}']:.3f} / "
+            f"{_sm[f'sel/feat_freq_p90_{_tag}']:.3f}",
+            f"    img_active_frac    = {_sm[f'sel/img_active_frac_{_tag}']:.4f}  (sparse→low)",
+            f"    img_active_mean    = {_sm[f'sel/img_active_mean_{_tag}']:.1f}  features/image",
+        ]
+
+    # decoder weight norm per latent dim (linear decoder only)
+    _dec_lines = []
+    _dec_metrics = {}
+    if hasattr(model, "decoder") and hasattr(model.decoder, "weight"):
+        _col_norms = model.decoder.weight.float().norm(dim=0).cpu()  # [D]
+        _thr_vals = [0.01, 0.05, 0.1, 0.5]
+        _max_norm = _col_norms.max().item()
+        _dec_metrics = {
+            "dec_col_norm_mean":   _col_norms.mean().item(),
+            "dec_col_norm_max":    _max_norm,
+            "dec_col_norm_std":    _col_norms.std().item(),
+        }
+        for _t in _thr_vals:
+            _abs_thr = _t * _max_norm
+            _n = (_col_norms > _abs_thr).sum().item()
+            _dec_metrics[f"dec_active_norm_{str(_t).replace('.','p')}"] = _n
+        _thr_lines = []
+        for _t in _thr_vals:
+            _key = "dec_active_norm_" + str(_t).replace(".", "p")
+            _thr_lines.append(
+                f"  dims with norm > {_t:.0%}·max: {_dec_metrics[_key]} / {args.latent_dim}"
+            )
+        _dec_lines = [
+            "",
+            "## Decoder Column Norms  (linear decoder; proxy for latent dim usage)",
+            f"  mean = {_dec_metrics['dec_col_norm_mean']:.4f}",
+            f"  std  = {_dec_metrics['dec_col_norm_std']:.4f}",
+            f"  max  = {_dec_metrics['dec_col_norm_max']:.4f}",
+        ] + _thr_lines
+
+    eot = {**_fd, **_kl, **_mom, **_eot_sel, **_dec_metrics}
+    wandb.summary.update({f"eot/{k}": v for k, v in eot.items()})
+
+    _report_lines = [
+        "# Stage-1 End-of-Training Diagnostics",
+        (
+            f"beta_kl={args.beta_kl}  lambda_sigreg={args.lambda_sigreg}"
+            f"  kl_warmup={args.beta_kl_warmup_epochs}  epochs={args.epochs}"
+        ),
+        "",
+        "## z-space Frechet Distance  (lower → closer to N(0,I))",
+        f"  z_fd_diag = {_fd['z_fd_diag']:.4f}   [||µ||² + Σ(σᵢ-1)²]",
+        f"  z_fd_proj = {_fd['z_fd_proj']:.6f}  [sliced, 512 projections]",
+        "",
+        "## KL Active Dimensions",
+        f"  kl_total   = {_kl['kl_total']:.1f}",
+        f"  active@0.1 = {int(_kl['active_dims_at_0_1'])}",
+        f"  active@0.5 = {int(_kl['active_dims_at_0_5'])}",
+        f"  active@1.0 = {int(_kl['active_dims_at_1'])}",
+        "",
+        "## Selective Activity (per-image KL threshold)",
+        *_eot_sel_lines,
+        "",
+        "## Marginal Moments",
+        f"  mean_abs_mean  = {_mom['marginal_mean_abs_mean']:.4f}   (target 0)",
+        f"  std_mean       = {_mom['marginal_std_mean']:.4f}   (target 1)",
+        f"  std_std        = {_mom['marginal_std_std']:.4f}   (target 0)",
+        f"  skew_abs_mean  = {_mom['marginal_skew_abs_mean']:.4f}   (target 0)",
+        f"  kurt_abs_mean  = {_mom['marginal_excess_kurt_abs_mean']:.4f}   (target 0)",
+        *_dec_lines,
+    ]
+    _report_text = "\n".join(_report_lines) + "\n"
+    _report_path = ckpt_dir / "diagnostics_report.md"
+    _report_path.write_text(_report_text)
+    print(_report_text, flush=True)
+    print(f"[eot] report → {_report_path}", flush=True)
 
     samples = sample_from_prior(model, 8, args.latent_dim, device)
     print(f"Prior samples: {samples.shape}")
