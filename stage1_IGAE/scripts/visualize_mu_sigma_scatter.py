@@ -22,7 +22,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.vae_sigreg import OvercompleteVariationalAE
 
 # ── Config ─────────────────────────────────────────────────────────────────
-CKPT = Path("/scratch/x3411a10/IGAE/stage1_IGAE/checkpoints/s1_tierA_b7e-4_l10_w50/best.pt")
+RUN_NAME = "s1_grid_b1e-3_l100_lindec"
+CKPT = Path(f"/scratch/x3411a10/IGAE/stage1_IGAE/checkpoints/{RUN_NAME}/best.pt")
 DATA = Path("/scratch/x3411a10/datasets/ffhq256/dino_features_train.pt")
 N_IMAGES = 3000
 OUT = Path("/scratch/x3411a10/IGAE/stage1_IGAE/visualizations/mu_sigma_scatter.png")
@@ -85,7 +86,7 @@ for d, lbl in zip(dims, labels):
 # ── Plot ──────────────────────────────────────────────────────────────────
 fig, axes = plt.subplots(1, 3, figsize=(15, 5), sharey=False)
 fig.suptitle(
-    f"mu vs sigma per image  (N={N_IMAGES}, model=s1_tierA_b7e-4_l10_w50)\n"
+    f"mu vs sigma per image  (N={N_IMAGES}, model={RUN_NAME})\n"
     "Prior N(0,1): mu=0 (dashed), sigma=1 (dotted)",
     fontsize=12,
 )

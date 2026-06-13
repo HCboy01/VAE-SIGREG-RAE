@@ -36,12 +36,11 @@ from src.vae_sigreg import (
     compute_selective_activity,
     compute_z_frechet_distance,
     kl_bottleneck_loss,
-    kl_feature_level,
-    kl_feature_level_log,
-    kl_feature_level_sq,
-    l1_mu_loss,
     reconstruction_loss,
     sample_from_prior,
+    sigma_feature_deviation_loss,
+    sigma_low_fraction_loss,
+    sigma_low_tail_target_loss,
 )
 
 
@@ -125,12 +124,19 @@ def latent_batch_metrics(mu: torch.Tensor, logvar: torch.Tensor, z: torch.Tensor
 
     kl_dim = 0.5 * (mu_f.pow(2) + logvar_f.exp() - logvar_f - 1).mean(dim=0)
     active_units = (kl_dim > 0.01).sum()
+    sigma_mean = (0.5 * logvar_f).exp().mean(dim=0)
+    sigma_dev = sigma_mean - 1.0
 
     return {
         "latent_mean_error": z_mean_abs.item(),
         "latent_variance_error": z_var_err.item(),
         "covariance_offdiag_error": off_diag_cov.item(),
         "active_units": active_units.item(),
+        "sigma_feature_mean": sigma_mean.mean().item(),
+        "sigma_feature_dev_abs": sigma_dev.abs().mean().item(),
+        "sigma_feature_dev_rms": sigma_dev.pow(2).mean().sqrt().item(),
+        "sigma_feature_below_0_9_frac": sigma_mean.lt(0.9).float().mean().item(),
+        "sigma_feature_above_1_1_frac": sigma_mean.gt(1.1).float().mean().item(),
     }
 
 
@@ -160,15 +166,17 @@ def parse_args():
     p.add_argument("--latent_dim", type=int,   default=6144)
     p.add_argument("--hidden_dim", type=int,   default=None)
     p.add_argument("--num_layers", type=int,   default=4)
-    p.add_argument("--linear_decoder", action="store_true", default=True,
-                   help="use single linear layer as decoder (default: True)")
+    p.add_argument("--linear_decoder", action="store_true", default=False,
+                   help="use single linear layer as decoder (default: MLP decoder)")
     p.add_argument("--no_linear_decoder", dest="linear_decoder", action="store_false",
-                   help="use MLP decoder instead of linear")
+                   help="use MLP decoder (default)")
 
     # training
     p.add_argument("--epochs",      type=int,   default=200)
-    p.add_argument("--batch_size",  type=int,   default=512)
-    p.add_argument("--accum_steps", type=int,   default=4,   help="gradient accumulation (effective batch = batch*accum)")
+    p.add_argument("--batch_size",  type=int,   default=2048,
+                   help="physical batch size; feature-level losses use this batch's statistics")
+    p.add_argument("--accum_steps", type=int,   default=1,
+                   help="gradient accumulation (effective batch = batch*accum); batch-stat losses are computed per physical batch")
     p.add_argument("--lr",          type=float, default=3e-4)
     p.add_argument("--weight_decay",type=float, default=1e-2)
     p.add_argument("--grad_clip",   type=float, default=1.0)
@@ -181,24 +189,56 @@ def parse_args():
     # loss weights
     p.add_argument("--beta_kl",             type=float, default=1e-3)
     p.add_argument("--beta_kl_warmup_epochs",type=int,  default=30,  help="linearly ramp beta_kl from 0 over N epochs")
-    p.add_argument("--kl_type", type=str, default="sample",
-                   choices=["sample", "feature", "feature_sq", "feature_log", "sample_l1"],
-                   help="sample: standard per-image KL (default). "
-                        "feature: marginal KL per dim — penalises always-on dims directly. "
-                        "feature_sq: sum_d(mean_n[KL_d])^2 — no cancellation, gradient proportional to mean KL. "
-                        "feature_log: sum_d log(1+mean_n[KL_d]) — sparsity-inducing, gradient saturates for active dims. "
-                        "sample_l1: standard KL + alpha_l1 * mean|mu| — Laplace prior sharpens sparsity.")
-    p.add_argument("--alpha_l1",            type=float, default=0.0,
-                   help="weight for L1 penalty on |mu| (only used when kl_type=sample_l1)")
     p.add_argument("--lambda_sigreg",       type=float, default=0.1)
     p.add_argument("--num_projections",     type=int,   default=512)
-    p.add_argument("--sigreg_type", type=str, default="epps_pulley",
-                   choices=["epps_pulley", "moment", "none"])
-    p.add_argument("--sigreg_target", type=str, default="z", choices=["z", "mu", "mu_feat"],
-                   help="z/mu: image-axis SIGReg (B samples in D-space). "
-                        "mu_feat: feature-axis SIGReg — transposes mu to [D, B], "
-                        "treating D=6144 features as samples and pushing each "
-                        "feature's distribution across images toward N(0,1).")
+    p.add_argument("--lambda_mu_l1",        type=float, default=0.0,
+                   help="weight for per-sample latent mean L1 regularizer mean(|mu|)")
+    p.add_argument("--lambda_logsigma_l1",  type=float, default=0.0,
+                   help="weight for posterior log-sigma L1 regularizer mean(|0.5*logvar|)")
+    p.add_argument("--lambda_mu_sq",        type=float, default=0.0,
+                   help="weight for latent mean squared regularizer mean(mu^2)")
+    p.add_argument("--lambda_logsigma_l2",  type=float, default=0.0,
+                   help="weight for posterior log-sigma squared regularizer mean((0.5*logvar)^2)")
+    p.add_argument("--lambda_mu_sigma_l1",  type=float, default=0.0,
+                   help="weight for coupled latent sparsity regularizer mean(|mu * sigma|)")
+    p.add_argument("--lambda_precision_signal", type=float, default=0.0,
+                   help="weight for hinge penalty mean(relu(1/sigma^2 - 1 - kappa*signal(mu)))")
+    p.add_argument("--precision_signal_kappa", type=float, default=1.0,
+                   help="allowed precision gain per unit signal(mu)")
+    p.add_argument("--precision_signal_target", choices=["sq", "abs"], default="sq",
+                   help="signal(mu) used by precision_signal: sq=mu^2, abs=|mu|")
+    p.add_argument("--lambda_inactive_conf", type=float, default=0.0,
+                   help="weight for penalizing low sigma where |mu| is inactive")
+    p.add_argument("--mu_gate_threshold", type=float, default=0.1,
+                   help="|mu| threshold for inactive-confidence gate")
+    p.add_argument("--mu_gate_temperature", type=float, default=0.05,
+                   help="temperature for sigmoid((|mu|-threshold)/temperature)")
+    p.add_argument("--lambda_sigma_dev",    type=float, default=0.0,
+                   help="weight for batch feature-axis sigma deviation regularizer")
+    p.add_argument("--sigma_dev_target",    type=float, default=1.0,
+                   help="target for mean_B sigma_d")
+    p.add_argument("--sigma_dev_metric",    type=str, default="l2", choices=["l1", "l2"],
+                   help="deviation metric for mean_B sigma_d around target")
+    p.add_argument("--sigma_dev_only_below", action="store_true",
+                   help="only penalize feature mean sigmas below target")
+    p.add_argument("--lambda_sigma_lowfrac", type=float, default=0.0,
+                   help="weight for feature-wise low-sigma fraction regularizer")
+    p.add_argument("--sigma_lowfrac_threshold", type=float, default=0.8,
+                   help="sigma is considered low when sigma < this threshold")
+    p.add_argument("--sigma_lowfrac_target", type=float, default=0.1,
+                   help="maximum desired soft low-sigma fraction per feature")
+    p.add_argument("--sigma_lowfrac_min", type=float, default=0.0,
+                   help="minimum desired soft low-sigma fraction per feature")
+    p.add_argument("--sigma_lowfrac_temperature", type=float, default=0.05,
+                   help="temperature for soft indicator sigmoid((threshold-sigma)/temperature)")
+    p.add_argument("--lambda_sigma_tail", type=float, default=0.0,
+                   help="weight for feature-wise low-tail sigma target regularizer")
+    p.add_argument("--sigma_tail_fraction", type=float, default=0.05,
+                   help="bottom fraction of images per feature used for sigma tail target")
+    p.add_argument("--sigma_tail_target", type=float, default=0.5,
+                   help="target mean sigma for each feature's low tail")
+    p.add_argument("--sigma_tail_metric", type=str, default="l2", choices=["l1", "l2"],
+                   help="deviation metric for sigma low-tail target")
     p.add_argument("--ep_num_points", type=int, default=33)
     p.add_argument("--ep_t_min", type=float, default=-5.0)
     p.add_argument("--ep_t_max", type=float, default=5.0)
@@ -215,7 +255,7 @@ def parse_args():
                    default=[0.1, 0.5],
                    help="Thresholds logged for dead-neuron counting over the full validation set.")
     p.add_argument("--dead_activation_target", type=str, default="mu", choices=["mu", "z"],
-                   help="Target used for dead-neuron counting. mu is deterministic; z includes sampling noise.")
+                   help="Target used for dead-neuron counting. mu is stable; z includes sampling noise.")
     p.add_argument("--resume",       type=str, default=None, help="full resume: load model+optimizer+epoch")
     p.add_argument("--init_weights", type=str, default=None, help="load model weights only, train from epoch 1")
 
@@ -262,6 +302,13 @@ def main():
     eff_batch = args.batch_size * args.accum_steps
     print(f"Train={len(train_loader)} batches  Val={len(val_loader)} batches  "
           f"eff_batch={eff_batch}")
+    if args.accum_steps > 1:
+        print(
+            "[warn] accum_steps > 1: SIGReg statistics are "
+            "computed on each physical batch, not the accumulated effective batch. "
+            "Use --batch_size 2048 --accum_steps 1 for the default grid.",
+            flush=True,
+        )
 
     # --- Model ---
     model = OvercompleteVariationalAE(
@@ -280,7 +327,6 @@ def main():
     )
     scheduler = make_scheduler(optimizer, args.warmup_epochs, args.epochs)
     sigreg_module = build_sigreg_loss(
-        sigreg_type=args.sigreg_type,
         num_projections=args.num_projections,
         ep_num_points=args.ep_num_points,
         ep_t_min=args.ep_t_min,
@@ -338,22 +384,63 @@ def main():
             with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                 out = model(x)
                 rec  = reconstruction_loss(out["x_hat"], x)
-                if args.kl_type == "sample_l1":
-                    kl_base = kl_bottleneck_loss(out["mu"], out["logvar"])
-                    l1_mu   = l1_mu_loss(out["mu"])
-                    kl      = kl_base + args.alpha_l1 * l1_mu
+                kl = kl_bottleneck_loss(out["mu"], out["logvar"])
+                sig = sigreg_module(out["z"])
+                mu_l1 = out["mu"].float().abs().mean()
+                logsigma = 0.5 * out["logvar"].float()
+                logsigma_l1 = logsigma.abs().mean()
+                mu_sq = out["mu"].float().pow(2).mean()
+                logsigma_l2 = logsigma.pow(2).mean()
+                sigma = (0.5 * out["logvar"].float()).exp()
+                mu_sigma_l1 = (out["mu"].float() * sigma).abs().mean()
+                precision_gain = torch.exp(-out["logvar"].float()) - 1.0
+                if args.precision_signal_target == "abs":
+                    signal = out["mu"].float().abs()
                 else:
-                    _kl_fn = {"feature": kl_feature_level, "feature_sq": kl_feature_level_sq,
-                              "feature_log": kl_feature_level_log}.get(args.kl_type, kl_bottleneck_loss)
-                    kl    = _kl_fn(out["mu"], out["logvar"])
-                    kl_base = kl
-                    l1_mu   = out["mu"].new_zeros(())
-                if args.sigreg_target == "mu_feat":
-                    sig_target = out["mu"].T   # [D, B]: feature-axis
-                else:
-                    sig_target = out[args.sigreg_target]
-                sig  = sigreg_module(sig_target)
-                loss = (rec + beta_kl_now * kl + args.lambda_sigreg * sig) / args.accum_steps
+                    signal = out["mu"].float().pow(2)
+                precision_signal = torch.relu(
+                    precision_gain - args.precision_signal_kappa * signal
+                ).mean()
+                mu_gate = torch.sigmoid(
+                    (out["mu"].float().abs().detach() - args.mu_gate_threshold)
+                    / max(args.mu_gate_temperature, 1e-6)
+                )
+                inactive_conf = ((1.0 - mu_gate) * torch.relu(1.0 - sigma)).mean()
+                sigma_dev = sigma_feature_deviation_loss(
+                    out["logvar"],
+                    target=args.sigma_dev_target,
+                    metric=args.sigma_dev_metric,
+                    only_below=args.sigma_dev_only_below,
+                )
+                sigma_lowfrac = sigma_low_fraction_loss(
+                    out["logvar"],
+                    threshold=args.sigma_lowfrac_threshold,
+                    target_fraction=args.sigma_lowfrac_target,
+                    min_fraction=args.sigma_lowfrac_min,
+                    temperature=args.sigma_lowfrac_temperature,
+                )
+                sigma_tail = sigma_low_tail_target_loss(
+                    out["logvar"],
+                    tail_fraction=args.sigma_tail_fraction,
+                    target=args.sigma_tail_target,
+                    metric=args.sigma_tail_metric,
+                )
+                total = (
+                    rec
+                    + beta_kl_now * kl
+                    + args.lambda_sigreg * sig
+                    + args.lambda_mu_l1 * mu_l1
+                    + args.lambda_logsigma_l1 * logsigma_l1
+                    + args.lambda_mu_sq * mu_sq
+                    + args.lambda_logsigma_l2 * logsigma_l2
+                    + args.lambda_mu_sigma_l1 * mu_sigma_l1
+                    + args.lambda_precision_signal * precision_signal
+                    + args.lambda_inactive_conf * inactive_conf
+                    + args.lambda_sigma_dev * sigma_dev
+                    + args.lambda_sigma_lowfrac * sigma_lowfrac
+                    + args.lambda_sigma_tail * sigma_tail
+                )
+                loss = total / args.accum_steps
 
             loss.backward()
 
@@ -367,11 +454,20 @@ def main():
             batch_health = latent_batch_metrics(out["mu"], out["logvar"], out["z"])
             _mu_batch_mean_abs = out["mu"].detach().mean(dim=0).abs().mean()
             for k, v in [
-                ("rec_loss", rec), ("kl_loss", kl), ("kl_base_loss", kl_base),
-                ("l1_mu_loss", l1_mu),
+                ("rec_loss", rec), ("kl_loss", kl), ("kl_base_loss", kl),
                 ("sigreg_loss", sig),
-                ("ep_sigreg_loss", sig if args.sigreg_type == "epps_pulley" else sig.detach() * 0.0),
-                ("total_loss", rec + beta_kl_now * kl + args.lambda_sigreg * sig),
+                ("ep_sigreg_loss", sig),
+                ("mu_l1_loss", mu_l1),
+                ("logsigma_l1_loss", logsigma_l1),
+                ("mu_sq_loss", mu_sq),
+                ("logsigma_l2_loss", logsigma_l2),
+                ("mu_sigma_l1_loss", mu_sigma_l1),
+                ("precision_signal_loss", precision_signal),
+                ("inactive_conf_loss", inactive_conf),
+                ("sigma_dev_loss", sigma_dev),
+                ("sigma_lowfrac_loss", sigma_lowfrac),
+                ("sigma_tail_loss", sigma_tail),
+                ("total_loss", total),
                 ("mu_sq_mean", out["mu"].pow(2).mean().detach()),
                 ("exp_logvar_mean", out["logvar"].exp().mean().detach()),
                 ("mu_batch_mean_abs", _mu_batch_mean_abs),
@@ -400,29 +496,81 @@ def main():
                 with torch.amp.autocast(device_type="cuda", dtype=amp_dtype, enabled=use_amp):
                     out = model(x)
                     rec = reconstruction_loss(out["x_hat"], x)
-                    if args.kl_type == "sample_l1":
-                        kl_base_v = kl_bottleneck_loss(out["mu"], out["logvar"])
-                        l1_mu_v   = l1_mu_loss(out["mu"])
-                        kl        = kl_base_v + args.alpha_l1 * l1_mu_v
+                    kl = kl_bottleneck_loss(out["mu"], out["logvar"])
+                    sig = sigreg_module(out["z"])
+                    mu_l1 = out["mu"].float().abs().mean()
+                    logsigma = 0.5 * out["logvar"].float()
+                    logsigma_l1 = logsigma.abs().mean()
+                    mu_sq = out["mu"].float().pow(2).mean()
+                    logsigma_l2 = logsigma.pow(2).mean()
+                    sigma = (0.5 * out["logvar"].float()).exp()
+                    mu_sigma_l1 = (out["mu"].float() * sigma).abs().mean()
+                    precision_gain = torch.exp(-out["logvar"].float()) - 1.0
+                    if args.precision_signal_target == "abs":
+                        signal = out["mu"].float().abs()
                     else:
-                        _kl_fn = {"feature": kl_feature_level, "feature_sq": kl_feature_level_sq,
-                                  "feature_log": kl_feature_level_log}.get(args.kl_type, kl_bottleneck_loss)
-                        kl        = _kl_fn(out["mu"], out["logvar"])
-                        kl_base_v = kl
-                        l1_mu_v   = out["mu"].new_zeros(())
-                    if args.sigreg_target == "mu_feat":
-                        sig = sigreg_module(out["mu"].T)
-                    else:
-                        sig = sigreg_module(out[args.sigreg_target])
+                        signal = out["mu"].float().pow(2)
+                    precision_signal = torch.relu(
+                        precision_gain - args.precision_signal_kappa * signal
+                    ).mean()
+                    mu_gate = torch.sigmoid(
+                        (out["mu"].float().abs().detach() - args.mu_gate_threshold)
+                        / max(args.mu_gate_temperature, 1e-6)
+                    )
+                    inactive_conf = ((1.0 - mu_gate) * torch.relu(1.0 - sigma)).mean()
+                    sigma_dev = sigma_feature_deviation_loss(
+                        out["logvar"],
+                        target=args.sigma_dev_target,
+                        metric=args.sigma_dev_metric,
+                        only_below=args.sigma_dev_only_below,
+                    )
+                    sigma_lowfrac = sigma_low_fraction_loss(
+                        out["logvar"],
+                        threshold=args.sigma_lowfrac_threshold,
+                        target_fraction=args.sigma_lowfrac_target,
+                        min_fraction=args.sigma_lowfrac_min,
+                        temperature=args.sigma_lowfrac_temperature,
+                    )
+                    sigma_tail = sigma_low_tail_target_loss(
+                        out["logvar"],
+                        tail_fraction=args.sigma_tail_fraction,
+                        target=args.sigma_tail_target,
+                        metric=args.sigma_tail_metric,
+                    )
+                    total = (
+                        rec
+                        + beta_kl_now * kl
+                        + args.lambda_sigreg * sig
+                        + args.lambda_mu_l1 * mu_l1
+                        + args.lambda_logsigma_l1 * logsigma_l1
+                        + args.lambda_mu_sq * mu_sq
+                        + args.lambda_logsigma_l2 * logsigma_l2
+                        + args.lambda_mu_sigma_l1 * mu_sigma_l1
+                        + args.lambda_precision_signal * precision_signal
+                        + args.lambda_inactive_conf * inactive_conf
+                        + args.lambda_sigma_dev * sigma_dev
+                        + args.lambda_sigma_lowfrac * sigma_lowfrac
+                        + args.lambda_sigma_tail * sigma_tail
+                    )
 
                 kl_sample = kl_bottleneck_loss(out["mu"], out["logvar"])
                 batch_health = latent_batch_metrics(out["mu"], out["logvar"], out["z"])
                 for k, v in [
-                    ("rec_loss", rec), ("kl_loss", kl), ("kl_base_loss", kl_base_v),
-                    ("l1_mu_loss", l1_mu_v), ("kl_sample_loss", kl_sample),
+                    ("rec_loss", rec), ("kl_loss", kl), ("kl_base_loss", kl),
+                    ("kl_sample_loss", kl_sample),
                     ("sigreg_loss", sig),
-                    ("ep_sigreg_loss", sig if args.sigreg_type == "epps_pulley" else sig * 0.0),
-                    ("total_loss", rec + beta_kl_now * kl + args.lambda_sigreg * sig),
+                    ("ep_sigreg_loss", sig),
+                    ("mu_l1_loss", mu_l1),
+                    ("logsigma_l1_loss", logsigma_l1),
+                    ("mu_sq_loss", mu_sq),
+                    ("logsigma_l2_loss", logsigma_l2),
+                    ("mu_sigma_l1_loss", mu_sigma_l1),
+                    ("precision_signal_loss", precision_signal),
+                    ("inactive_conf_loss", inactive_conf),
+                    ("sigma_dev_loss", sigma_dev),
+                    ("sigma_lowfrac_loss", sigma_lowfrac),
+                    ("sigma_tail_loss", sigma_tail),
+                    ("total_loss", total),
                     ("mu_sq_mean", out["mu"].pow(2).mean()),
                     ("exp_logvar_mean", out["logvar"].exp().mean()),
                 ]:
@@ -541,6 +689,16 @@ def main():
             f"kl={val_metrics['kl_loss']:.1f}  "
             f"kl_s={val_metrics.get('kl_sample_loss', float('nan')):.2f}  "
             f"sig={val_metrics['sigreg_loss']:.4f}  "
+            f"mul1={val_metrics.get('mu_l1_loss', 0.0):.4f}  "
+            f"logsigl1={val_metrics.get('logsigma_l1_loss', 0.0):.4f}  "
+            f"musq={val_metrics.get('mu_sq_loss', 0.0):.4f}  "
+            f"logsigl2={val_metrics.get('logsigma_l2_loss', 0.0):.4f}  "
+            f"musigl1={val_metrics.get('mu_sigma_l1_loss', 0.0):.4f}  "
+            f"precsig={val_metrics.get('precision_signal_loss', 0.0):.4f}  "
+            f"inconf={val_metrics.get('inactive_conf_loss', 0.0):.4f}  "
+            f"sigmad={val_metrics.get('sigma_dev_loss', 0.0):.4f}  "
+            f"siglow={val_metrics.get('sigma_lowfrac_loss', 0.0):.4f}  "
+            f"sigtail={val_metrics.get('sigma_tail_loss', 0.0):.4f}  "
             f"total={val_metrics['total_loss']:.4f}  "
             f"dead={val_metrics.get(f'sel/feat_never_active_{_ptag}', float('nan')):.3f}  "
             f"always={val_metrics.get(f'sel/feat_always_active_{_ptag}', float('nan')):.3f}  "
@@ -588,6 +746,88 @@ def main():
     _fd   = compute_z_frechet_distance(_z_all)
     _kl   = compute_kl_active_dims(_mu_all, _lgv_all, thresholds=(0.1, 0.5, 1.0))
     _mom  = compute_marginal_moments(_z_all)
+    _l1_metrics = {
+        "mu_l1_loss": _mu_all.abs().mean().item(),
+        "logsigma_l1_loss": (0.5 * _lgv_all).abs().mean().item(),
+        "mu_sq_loss": _mu_all.pow(2).mean().item(),
+        "logsigma_l2_loss": (0.5 * _lgv_all).pow(2).mean().item(),
+        "mu_sigma_l1_loss": (_mu_all * (0.5 * _lgv_all).exp()).abs().mean().item(),
+        "precision_signal_loss": torch.relu(
+            torch.exp(-_lgv_all)
+            - 1.0
+            - args.precision_signal_kappa
+            * (_mu_all.abs() if args.precision_signal_target == "abs" else _mu_all.pow(2))
+        ).mean().item(),
+    }
+    _mu_gate_all = torch.sigmoid(
+        (_mu_all.abs() - args.mu_gate_threshold)
+        / max(args.mu_gate_temperature, 1e-6)
+    )
+    _sigma_all = (0.5 * _lgv_all).exp()
+    _inactive_conf_loss = ((1.0 - _mu_gate_all) * torch.relu(1.0 - _sigma_all)).mean()
+    _conf_metrics = {
+        "inactive_conf_loss": _inactive_conf_loss.item(),
+        "confident_sigma_frac": _sigma_all.lt(1.0).float().mean().item(),
+        "active_gate_frac": _mu_gate_all.gt(0.5).float().mean().item(),
+    }
+    _sigma_mean = (0.5 * _lgv_all).exp().mean(0)
+    _sigma_dev = _sigma_mean - args.sigma_dev_target
+    if args.sigma_dev_only_below:
+        _sigma_dev_for_loss = torch.clamp(_sigma_dev, max=0.0)
+    else:
+        _sigma_dev_for_loss = _sigma_dev
+    _sigma_loss = (
+        _sigma_dev_for_loss.abs().mean()
+        if args.sigma_dev_metric == "l1"
+        else _sigma_dev_for_loss.pow(2).mean()
+    )
+    _sigma_metrics = {
+        "sigma_feature_mean": _sigma_mean.mean().item(),
+        "sigma_feature_dev_abs": _sigma_dev.abs().mean().item(),
+        "sigma_feature_dev_rms": _sigma_dev.pow(2).mean().sqrt().item(),
+        "sigma_feature_dev_loss": _sigma_loss.item(),
+        "sigma_feature_below_0_9_frac": _sigma_mean.lt(0.9).float().mean().item(),
+        "sigma_feature_above_1_1_frac": _sigma_mean.gt(1.1).float().mean().item(),
+    }
+    _low_frac_hard = _sigma_all.lt(args.sigma_lowfrac_threshold).float().mean(0)
+    _low_score = torch.sigmoid(
+        (args.sigma_lowfrac_threshold - _sigma_all)
+        / max(args.sigma_lowfrac_temperature, 1e-6)
+    )
+    _low_frac = _low_score.mean(0)
+    _sigma_lowfrac_loss = (
+        torch.relu(_low_frac - args.sigma_lowfrac_target)
+        + torch.relu(args.sigma_lowfrac_min - _low_frac)
+    ).mean()
+    _sigma_lowfrac_metrics = {
+        "sigma_lowfrac_loss": _sigma_lowfrac_loss.item(),
+        "sigma_lowfrac_mean": _low_frac.mean().item(),
+        "sigma_lowfrac_p50": _low_frac.quantile(0.50).item(),
+        "sigma_lowfrac_p90": _low_frac.quantile(0.90).item(),
+        "sigma_lowfrac_hard_mean": _low_frac_hard.mean().item(),
+        "sigma_lowfrac_hard_p50": _low_frac_hard.quantile(0.50).item(),
+        "sigma_lowfrac_hard_p90": _low_frac_hard.quantile(0.90).item(),
+        "sigma_lowfrac_excess_frac": _low_frac.gt(args.sigma_lowfrac_target).float().mean().item(),
+        "sigma_lowfrac_under_frac": _low_frac.lt(args.sigma_lowfrac_min).float().mean().item(),
+    }
+    _tail_k = max(1, min(_sigma_all.shape[0], int(round(_sigma_all.shape[0] * args.sigma_tail_fraction))))
+    _tail_vals = torch.topk(_sigma_all, k=_tail_k, dim=0, largest=False).values
+    _tail_mean = _tail_vals.mean(0)
+    _tail_dev = _tail_mean - args.sigma_tail_target
+    _sigma_tail_loss = (
+        _tail_dev.abs().mean()
+        if args.sigma_tail_metric == "l1"
+        else _tail_dev.pow(2).mean()
+    )
+    _sigma_tail_metrics = {
+        "sigma_tail_loss": _sigma_tail_loss.item(),
+        "sigma_tail_mean": _tail_mean.mean().item(),
+        "sigma_tail_p10": _tail_mean.quantile(0.10).item(),
+        "sigma_tail_p50": _tail_mean.quantile(0.50).item(),
+        "sigma_tail_p90": _tail_mean.quantile(0.90).item(),
+        "sigma_tail_below_0_6_frac": _tail_mean.lt(0.6).float().mean().item(),
+        "sigma_tail_below_0_5_frac": _tail_mean.lt(0.5).float().mean().item(),
+    }
 
     # selective activity on full val set
     _eot_sel: dict = {}
@@ -642,13 +882,35 @@ def main():
             f"  max  = {_dec_metrics['dec_col_norm_max']:.4f}",
         ] + _thr_lines
 
-    eot = {**_fd, **_kl, **_mom, **_eot_sel, **_dec_metrics}
+    eot = {
+        **_fd, **_kl, **_mom, **_l1_metrics, **_conf_metrics,
+        **_sigma_metrics, **_sigma_lowfrac_metrics,
+        **_sigma_tail_metrics, **_eot_sel, **_dec_metrics,
+    }
     wandb.summary.update({f"eot/{k}": v for k, v in eot.items()})
 
     _report_lines = [
         "# Stage-1 End-of-Training Diagnostics",
         (
             f"beta_kl={args.beta_kl}  lambda_sigreg={args.lambda_sigreg}"
+            f"  lambda_mu_l1={args.lambda_mu_l1}"
+            f"  lambda_logsigma_l1={args.lambda_logsigma_l1}"
+            f"  lambda_mu_sq={args.lambda_mu_sq}"
+            f"  lambda_logsigma_l2={args.lambda_logsigma_l2}"
+            f"  lambda_mu_sigma_l1={args.lambda_mu_sigma_l1}"
+            f"  lambda_precision_signal={args.lambda_precision_signal}"
+            f"  precision_kappa={args.precision_signal_kappa:g}"
+            f"  precision_target={args.precision_signal_target}"
+            f"  lambda_inactive_conf={args.lambda_inactive_conf}"
+            f"  mu_gate={args.mu_gate_threshold:g}@{args.mu_gate_temperature:g}"
+            f"  lambda_sigma_dev={args.lambda_sigma_dev}"
+            f"  sigma_dev={args.sigma_dev_metric}@{args.sigma_dev_target:g}"
+            f"  sigma_only_below={args.sigma_dev_only_below}"
+            f"  lambda_sigma_lowfrac={args.lambda_sigma_lowfrac}"
+            f"  sigma_lowfrac=soft_frac(sigma<{args.sigma_lowfrac_threshold:g})"
+            f" in [{args.sigma_lowfrac_min:g},{args.sigma_lowfrac_target:g}]"
+            f"  lambda_sigma_tail={args.lambda_sigma_tail}"
+            f"  sigma_tail=bottom{args.sigma_tail_fraction:g}@{args.sigma_tail_target:g}"
             f"  kl_warmup={args.beta_kl_warmup_epochs}  epochs={args.epochs}"
         ),
         "",
@@ -671,6 +933,55 @@ def main():
         f"  std_std        = {_mom['marginal_std_std']:.4f}   (target 0)",
         f"  skew_abs_mean  = {_mom['marginal_skew_abs_mean']:.4f}   (target 0)",
         f"  kurt_abs_mean  = {_mom['marginal_excess_kurt_abs_mean']:.4f}   (target 0)",
+        "",
+        "## Latent L1 Penalties",
+        f"  mu_l1            = {_l1_metrics['mu_l1_loss']:.6f}",
+        f"  logsigma_l1      = {_l1_metrics['logsigma_l1_loss']:.6f}",
+        f"  mu_sq            = {_l1_metrics['mu_sq_loss']:.6f}",
+        f"  logsigma_l2      = {_l1_metrics['logsigma_l2_loss']:.6f}",
+        f"  mu_sigma_l1      = {_l1_metrics['mu_sigma_l1_loss']:.6f}",
+        f"  precision_signal = {_l1_metrics['precision_signal_loss']:.6f}",
+        "",
+        "## Inactive Confidence Gate",
+        f"  inactive_conf_loss = {_conf_metrics['inactive_conf_loss']:.6f}",
+        f"  frac(sigma < 1)    = {_conf_metrics['confident_sigma_frac']:.4f}",
+        f"  frac(|mu| gate on) = {_conf_metrics['active_gate_frac']:.4f}",
+        "",
+        "## Sigma Feature Deviation",
+        f"  sigma_feature_mean       = {_sigma_metrics['sigma_feature_mean']:.4f}   (target {args.sigma_dev_target:g})",
+        f"  sigma_feature_dev_abs    = {_sigma_metrics['sigma_feature_dev_abs']:.4f}",
+        f"  sigma_feature_dev_rms    = {_sigma_metrics['sigma_feature_dev_rms']:.4f}",
+        f"  sigma_feature_dev_loss   = {_sigma_metrics['sigma_feature_dev_loss']:.6f}",
+        f"  frac(mean_sigma < 0.9)   = {_sigma_metrics['sigma_feature_below_0_9_frac']:.4f}",
+        f"  frac(mean_sigma > 1.1)   = {_sigma_metrics['sigma_feature_above_1_1_frac']:.4f}",
+        "",
+        "## Sigma Low-Fraction Selectivity",
+        f"  threshold sigma < {args.sigma_lowfrac_threshold:g}",
+        f"  soft fraction band      = [{args.sigma_lowfrac_min:g}, {args.sigma_lowfrac_target:g}]",
+        f"  soft temperature        = {args.sigma_lowfrac_temperature:g}",
+        f"  sigma_lowfrac_loss      = {_sigma_lowfrac_metrics['sigma_lowfrac_loss']:.6f}",
+        f"  soft low_frac mean/p50/p90 = "
+        f"{_sigma_lowfrac_metrics['sigma_lowfrac_mean']:.4f} / "
+        f"{_sigma_lowfrac_metrics['sigma_lowfrac_p50']:.4f} / "
+        f"{_sigma_lowfrac_metrics['sigma_lowfrac_p90']:.4f}",
+        f"  hard low_frac mean/p50/p90 = "
+        f"{_sigma_lowfrac_metrics['sigma_lowfrac_hard_mean']:.4f} / "
+        f"{_sigma_lowfrac_metrics['sigma_lowfrac_hard_p50']:.4f} / "
+        f"{_sigma_lowfrac_metrics['sigma_lowfrac_hard_p90']:.4f}",
+        f"  frac(features over max) = {_sigma_lowfrac_metrics['sigma_lowfrac_excess_frac']:.4f}",
+        f"  frac(features under min) = {_sigma_lowfrac_metrics['sigma_lowfrac_under_frac']:.4f}",
+        "",
+        "## Sigma Low-Tail Target",
+        f"  tail fraction          = {args.sigma_tail_fraction:g}  (k={_tail_k} val images per feature)",
+        f"  target tail mean sigma = {args.sigma_tail_target:g}",
+        f"  sigma_tail_loss        = {_sigma_tail_metrics['sigma_tail_loss']:.6f}",
+        f"  tail_mean mean/p10/p50/p90 = "
+        f"{_sigma_tail_metrics['sigma_tail_mean']:.4f} / "
+        f"{_sigma_tail_metrics['sigma_tail_p10']:.4f} / "
+        f"{_sigma_tail_metrics['sigma_tail_p50']:.4f} / "
+        f"{_sigma_tail_metrics['sigma_tail_p90']:.4f}",
+        f"  frac(tail_mean < 0.6)  = {_sigma_tail_metrics['sigma_tail_below_0_6_frac']:.4f}",
+        f"  frac(tail_mean < 0.5)  = {_sigma_tail_metrics['sigma_tail_below_0_5_frac']:.4f}",
         *_dec_lines,
     ]
     _report_text = "\n".join(_report_lines) + "\n"

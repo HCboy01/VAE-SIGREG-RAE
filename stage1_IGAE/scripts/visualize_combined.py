@@ -94,12 +94,11 @@ def compute_metrics(mu, logvar):
 def make_figure(run_name, mu, logvar, sigma, kl_dim, metrics, batch_mu_mean, batch_sig2_mean, args_dict, n):
     beta = args_dict.get("beta_kl", "?")
     lam  = args_dict.get("lambda_sigreg", "?")
-    kl_type = args_dict.get("kl_type", "bottleneck")
     D = len(kl_dim)
 
     fig = plt.figure(figsize=(24, 9))
     fig.suptitle(
-        f"{run_name}   β={beta}  λ={lam}  kl_type={kl_type}   N={n}\n"
+        f"{run_name}   β={beta}  λ={lam}   N={n}\n"
         f"KL range: [{kl_dim.min():.4f}, {kl_dim.max():.4f}]  "
         f"median={kl_dim.median():.4f}  |  Prior: μ=0 (dashed), σ=1 (dotted)",
         fontsize=10,
@@ -181,7 +180,7 @@ def make_figure(run_name, mu, logvar, sigma, kl_dim, metrics, batch_mu_mean, bat
     ax_txt = fig.add_subplot(2, 5, 10)
     ax_txt.axis("off")
     lines = [f"{'─'*28}", f"  {run_name}", f"{'─'*28}", ""]
-    lines += [f"  β={beta}  λ={lam}  kl_type={kl_type}", ""]
+    lines += [f"  β={beta}  λ={lam}", ""]
     lines += [f"  KL dims (D={D}):"]
     lines += [f"    total kl = {kl_dim.sum():.1f}"]
     for thr in THRESHOLDS:

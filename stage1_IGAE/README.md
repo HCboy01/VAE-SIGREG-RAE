@@ -1,171 +1,245 @@
-# IGAE Stage-1: KL Loss Variants
+# IGAE Stage-1
 
-Overcomplete VAE with linear decoder on DINO features (FFHQ-256).  
-The central question: **어떤 KL loss가 소수의 dim만 선택적으로 활성화하면서 reconstruction도 잘 되게 하는가?**
+Overcomplete VAE on DINO features (FFHQ-256).
 
----
+## Kept Experiments
 
-## 모델 / 데이터
+The retained trained artifacts are the default Stage-1 grid:
 
-| 항목 | 값 |
-|------|----|
-| 데이터 | DINO ViT-B/8 features, FFHQ-256 (63001 × 768) |
-| 모델 | OvercompleteVariationalAE, linear decoder |
-| latent_dim | 6144 (input_dim × 8) |
-| num_layers | 4 |
-| β warmup | linear ramp, 50 epochs |
-| sigreg | Epps-Pulley (num_projections=512) |
-| epochs | 200, batch_size=2048, lr=3e-4 |
+- loss: sample KL + D-space Epps-Pulley SIGReg
+- checkpoint prefix: `s1_grid_*`
+- decoder default: MLP decoder; linear decoder variants are kept where present
+- data: DINO ViT-B/8 features, FFHQ-256
+- latent_dim: 6144
+- default physical batch size: 2048
 
----
+Artifacts kept:
 
-## KL Loss 변형 실험
+- `checkpoints/s1_grid*/`
+- grid-related visualizations under `visualizations/`
+- grid-related logs under `logs/`
 
-### 배경: 이상적인 latent space란?
+## Current Sigma-Confidence Probes
 
-- **대부분의 dim**: μ≈0, σ≈1 (prior와 동일, 비활성)
-- **소수의 dim**: μ≠0, σ<1 (특정 개념을 인코딩, 활성)
-- σ>1 또는 σ→0은 모두 비정상적
+These are active exploratory runs on top of the default grid setting
+`beta_kl=1e-4`, `lambda_sigreg=100`, MLP decoder, batch size 2048.
+The motivation is to make `sigma` act as image/feature confidence while keeping
+feature usage distributed instead of concentrated in a few global channels.
 
----
+### Sigma Mean Deviation
 
-### 1. `feature` — Feature-level KL (기준선)
+Initial regularizer:
 
-```
-L = Σ_d [ (mean_n[μ_d])²  +  (mean_n[σ²_d] - 1)² ]
-```
-
-**의도**: sample KL은 always-on feature(모든 이미지에서 활성화된 dim)와 selective feature(일부 이미지에서만 활성)를 구분하지 못함.
-Feature KL은 배치 평균 μ가 작은 selective dim에는 gradient가 작아 → reconstruction이 dominant → feature가 살아남는 selectivity 메커니즘을 가짐.
-
-**문제**: σ² 항을 평균 낸 뒤 제곱하므로, 어떤 이미지에서 σ>1, 다른 이미지에서 σ<1이면 상쇄되어 σ>1이 허용됨.
-
-| run | rec | active@0.1 | σ>1 | 특이사항 |
-|-----|-----|-----------|-----|---------|
-| b1e-3, λ=10 | 0.087 | 6144 | 있음 | 전 dim 약하게 활성 |
-| b1e-4, λ=10 | 0.004 | 407 | 있음 | 405개 강한 bottleneck, 우수한 marginal (std≈1, kurt≈0) |
-| b1e-3, λ=100 | 0.169 | 6144 | 있음 | sigreg가 σ 억제, kl_feature 작음 |
-| b1e-4, λ=100 | 0.061 | 407 | 있음 | b1e-4 l10보다 활성 dim 적음 |
-
----
-
-### 2. `feature_sq` — Squared Per-dim Mean KL
-
-```
-L = Σ_d ( mean_n[μ²_d] + mean_n[σ²_d - logσ²_d - 1] )²
-  = 4 · Σ_d (mean_n[KL_d])²
+```text
+sigma_mean_d = mean_B(sigma[:, d])
+loss = mean_d |target - sigma_mean_d| or (target - sigma_mean_d)^2
 ```
 
-**의도**: feature KL의 σ 상쇄 문제를 해결하기 위해 μ²와 σ²-logσ²-1을 각각 per-sample로 계산한 뒤 평균(부호 상쇄 없음), 그 합을 제곱.
-Gradient ∝ mean_n[KL_d] · μ_{n,d} → 낮은 KL dim은 gradient가 작아 selectivity 보존 기대.
+with `only_below=True`, so only feature means below the target are penalized.
 
-**문제**: Σ_d (mean_n[KL_d])²는 KL이 dim들에 **고르게 퍼질 때 최솟값** (볼록함수). 결과적으로 모든 dim이 비슷하게 약한 KL을 가지도록 수렴 → reconstruction 크게 저하.
+Runs:
 
-| run | rec | σ>1 | 특이사항 |
-|-----|-----|-----|---------|
-| b1e-3, λ=10 | 0.180 | 없음 | sigma 전 dim 균일(≈0.87) |
-| b1e-3, λ=100 | 0.213 | 없음 | 거의 collapse |
-| b1e-4, λ=10 | 0.109 | 없음 | sigma 균일, KL 분산 없음 |
-| b1e-4, λ=100 | 0.155 | 없음 | 4개 dim만 σ<0.8 |
+- `s1_grid_b1e-4_l100_sigmadev_l1_sd0p1_below`
+- `s1_grid_b1e-4_l100_sigmadev_l2_sd0p1_below`
+- `s1_grid_b1e-4_l100_sigmadev_l1_sd0p5_below`
+- `s1_grid_b1e-4_l100_sigmadev_l2_sd0p5_below`
+- `s1_grid_b1e-4_l100_sigmadev_l1_sd0p05_t0p5_below`
 
----
+Observations:
 
-### 3. `feature_log` v1 — Log Penalty (μ+σ 통합)
+- `target=1.0` with stronger weights made sigma means behave, but reduced useful
+  latent usage and worsened reconstruction.
+- `target=0.5` was too weak for the intended behavior; the penalty was nearly
+  inactive because feature mean sigma stayed well above 0.5.
+- Mean-sigma constraints do not distinguish selective confidence from a feature
+  being globally low-sigma.
 
-```
-L = Σ_d log(1 + mean_n[μ²_d] + mean_n[σ²_d - logσ²_d - 1])
-  = Σ_d log(1 + 2·mean_n[KL_d])
-```
+### Sigma Low-Fraction Upper Bound
 
-**의도**: 오목함수(concave) 패널티로 sparsity 유도.
-Σ_d log(1+f_d)는 f_d가 집중될 때 최솟값 → 소수 dim에 KL 집중을 선호.
-Gradient ∝ μ_{n,d} / (1 + f_d) → 활성 dim(f_d 큰)은 gradient 포화 → 살아남음.
+Next probe constrained the fraction of images for which a feature is low-sigma:
 
-**문제**: log 안에 σ 항이 함께 있어 f_d가 이미 크면 σ→0이어도 penalty 증가가 미미 → σ→0 허용 (deterministic AE 경향).
-
-| run | rec | active dim | σ<0.2 | 특이사항 |
-|-----|-----|-----------|-------|---------|
-| b1e-3, λ=10 | 0.228 | ≈0 | 0 | 거의 collapse |
-| b1e-3, λ=100 | 0.251 | 28 | - | 극소수만 활성 |
-| b1e-4, λ=10 | 0.047 | 417 | **235** | sparsity 작동, σ→0 문제 |
-| b1e-4, λ=100 | 0.107 | 185 | **140** | λ높을수록 더 sparse |
-
----
-
-### 4. `feature_log` v2 — Log Penalty (μ/σ 분리)
-
-```
-L = Σ_d log(1 + mean_n[μ²_d])           ← μ: log penalty로 sparsity
-  + Σ_d mean_n[σ²_d - logσ²_d - 1]      ← σ: log 밖에 직접 배치
+```text
+low_frac_d = mean_B[sigma[:, d] < 0.8]
+loss = mean_d relu(low_frac_d - 0.1)
 ```
 
-**의도**: v1의 σ→0 문제는 σ 항이 log 안에 있어 포화되었기 때문.
-σ 항을 log 밖으로 분리하면 σ→0 시 `-logσ²→∞`가 직접 작동 → σ→0 방지.
-동시에 μ의 log penalty는 sparsity를 유지.
+Run:
 
-| 항 | 역할 |
-|----|------|
-| `log(1 + mean_n[μ²_d])` | 소수 dim만 μ로 인코딩 (sparsity) |
-| `mean_n[σ²_d - logσ²_d - 1]` | σ∈(0,∞) 범위에서 1로 유도, 양 극단 방지 |
+- `s1_grid_b1e-4_l100_siglowfrac_t0p8_f0p1_l0p05`
 
-| run | rec | active@0.1 | active@0.5 | kl_total | z_fd_diag | 특이사항 |
-|-----|-----|-----------|-----------|---------|---------|---------|
-| b1e-3, λ=10 | 0.087 | 6144 | 7 | 2325.7 | 348.09 | 전 dim 활성, KL 폭발 |
-| b1e-3, λ=100 | 0.169 | 6144 | 0 | 1340.8 | 88.17 | 전 dim 활성, KL 폭발 |
-| b1e-4, λ=10 | 0.004 | 5696 | 1774 | 8814.2 | 756.44 | KL 극도 폭발, prior 완전 이탈 |
-| b1e-4, λ=100 | 0.061 | 407 | **405** | 2160.8 | 66.84 | σ→0 방지 확인, sparsity 작동 |
+Observation:
 
-**문제**: β=1e-4, λ=10처럼 SIGReg가 약할 때 KL이 폭발적으로 증가 (kl_total=8814). log penalty가 큰 KL dim에 gradient를 포화시켜 KL이 무제한 성장함. λ=100으로 SIGReg를 강하게 걸었을 때만 407 dim의 양호한 sparsity 달성.
+- This suppresses features that are low-sigma for too many images.
+- By itself it does not encourage dead features to become selectively confident.
 
----
+### Soft Sigma Low-Fraction Band
 
-### 5. `sample_l1` — Sample KL + L1 on |μ|
+Current best probe:
 
-```
-L = 0.5 · mean_n[ Σ_d (μ²_{n,d} + σ²_{n,d} - logσ²_{n,d} - 1) ]   ← 표준 sample KL
-  + α · mean_n mean_d |μ_{n,d}|                                       ← Laplace prior
+```text
+low_score_bd = sigmoid((0.8 - sigma_bd) / 0.05)
+low_frac_d = mean_B(low_score_bd)
+loss = mean_d [relu(0.02 - low_frac_d) + relu(low_frac_d - 0.10)]
 ```
 
-**의도**: 표준 sample KL의 μ gradient는 ∝ μ (L2) → μ가 작으면 gradient도 작아 "약하게 살아있는" dim이 많이 잔존.
-L1 추가 시 gradient = ±α (상수) → μ가 작아도 일정 크기로 0 방향 push → 더 날카로운 sparsity 기대 (Lasso 효과).
+Run:
 
-| run | rec | active@0.1 | kl_total | feat_never_active@0.1 | 특이사항 |
-|-----|-----|-----------|---------|----------------------|---------|
-| b1e-3, α=0 (baseline) | 0.177 | 41 | 80.8 | 0.714 | |
-| b1e-3, α=0.1 | 0.204 | 49 | 82.5 | 0.846 | α 효과 미미 |
-| b1e-3, α=1.0 | 0.204 | 49 | 82.3 | 0.857 | α=0.1과 동일 |
-| b1e-4, α=0 (baseline) | 0.108 | 386 | 526.1 | 0.139 | |
-| b1e-4, α=0.1 | 0.059 | 348 | 494.0 | **0.652** | dead dim 크게 증가 |
-| b1e-4, α=1.0 | 0.059 | 348 | 494.0 | **0.586** | α=0.1과 동일 |
+- `s1_grid_b1e-4_l100_siglowband_t0p8_min0p02_max0p1_l0p05`
 
-**문제**: α를 10배 높여도 (0.1→1.0) 결과가 동일 → L1이 약한 dim을 죽이는 임계점에 α=0.1에서 이미 도달. 이후 살아남는 dim들은 reconstruction gradient가 압도적으로 커서 α를 높여도 추가 억제 불가.
+End-of-training snapshot:
 
-더 근본적으로, L1은 sample KL과 마찬가지로 **배치 통계를 보지 않는** per-sample 패널티이므로, always-on dim과 selective dim을 구분하는 메커니즘이 없음. feature KL 계열이 이 문제를 더 직접적으로 해결함.
+- `rec ~= 0.1817`
+- `kl_total ~= 217.5`
+- `active@0.1 = 380`
+- `feat_never_active@0.1 = 0.0153`
+- `img_active_mean@0.1 = 490.7`
+- `soft low_frac mean/p50/p90 = 0.0396 / 0.0310 / 0.0658`
+- `hard low_frac mean/p50/p90 = 0.0001 / 0.0000 / 0.0000`
+- `frac(features under min) = 0.0000`
 
----
+Interpretation:
 
-## KL Loss 설계 원칙 (누적 학습)
+- The soft band dramatically reduced dead features under the KL>0.1 activity
+  metric.
+- However, it did not create many truly low `sigma < 0.8` or `sigma < 0.9`
+  responses. It mainly satisfied the soft sigmoid score.
+- If the goal is to have some images per feature reach `sigma ~= 0.5`, the next
+  candidate should directly target the low tail, e.g. bottom-2% or bottom-5%
+  sigma per feature pulled toward 0.5, plus an upper-bound guard to prevent
+  global low-sigma channels.
 
-| 문제 | 원인 | 해결 방향 |
-|------|------|----------|
-| σ>1 허용 | `(mean_n[σ²_d]-1)²`: 평균 후 제곱 → 상쇄 가능 | σ 항은 per-sample 계산 후 평균 |
-| KL 균일 확산 | L2(squared) on per-dim KL: 볼록함수, spread 선호 | 오목함수(log) 사용 |
-| σ→0 허용 | σ 항이 log 안에 있어 포화 | σ 항은 log 밖에 독립 배치 |
-| selectivity 부재 | gradient가 모든 dim에 동일 크기 | 배치 통계(mean_n[KL_d])로 gradient 스케일 조정 |
-| KL 폭발 | log penalty가 큰 KL dim에 gradient 포화 → 무제한 성장 | SIGReg(λ)로 외부 억제 필요, 또는 KL upper bound 도입 |
-| L1 α 불감도 | 임계점 이하 dim은 α=0.1로도 충분히 억제 / 이상 dim은 recon이 압도 | α 탐색보다 배치 통계 기반 설계가 근본 해결책 |
+### KL plus `|mu| * sigma` Coupling
 
----
+Follow-up probe:
 
-## 구현 위치
+```text
+loss = reconstruction + beta_kl * KL + lambda * mean_BD(|mu| * sigma)
+```
 
-| 파일 | 내용 |
-|------|------|
-| `src/vae_sigreg/losses.py` | `kl_feature_level`, `kl_feature_level_sq`, `kl_feature_level_log`, `l1_mu_loss` |
-| `train_run.py` | `--kl_type {sample, feature, feature_sq, feature_log, sample_l1}`, `--alpha_l1` |
-| `scripts/sweep_feat_kl.sh` | feature KL sweep (β × λ) |
-| `scripts/sweep_featklsq.sh` | feature_sq sweep |
-| `scripts/sweep_featkllog.sh` | feature_log sweep (v1→v2 공용) |
-| `scripts/sweep_samplel1.sh` | sample_l1 sweep (β × α_l1) |
-| `scripts/batch_mu_sigma_combined_lindec.py` | 시각화: μ-σ scatter (KL quantile 5패널 + per-dim scatter) |
-| `visualizations/mu_sigma_combined_lindec/` | 각 checkpoint별 시각화 결과 PNG |
+Motivation:
+
+- If a feature carries information through a large `|mu|`, lowering `sigma`
+  reduces the `|mu| * sigma` penalty.
+- The hope was that this would couple confidence to active `mu`, while the KL
+  term would keep most inactive dimensions near the prior.
+
+Runs:
+
+- `s1_grid_b1e-4_kl_musigl1_l0p05`
+- `s1_grid_b1e-4_kl_musigl1_l0p1`
+- `s1_grid_b1e-4_kl_musigl1_l0p5`
+
+Snapshots:
+
+| run | status | rec | kl | active@0.1 | notes |
+|---|---:|---:|---:|---:|---|
+| `lambda=0.05` | done | `~0.103` | `~172` | `97` | many dead features; max-KL dim remains global low-sigma |
+| `lambda=0.1` | done | `~0.102` | `~187` | `90` | stronger `mu` shrinkage; max-KL dim `sigma ~= 0.123` |
+| `lambda=0.5` | running/early negative | `~0.306` | `~95` | very low | near-collapse; `dead ~= 0.993`, `img_frac ~= 0.007` around epoch 150 |
+
+Interpretation:
+
+- This objective did not solve the global low-sigma channel problem.
+- Increasing `lambda` mostly reduced `mu` usage and increased dead features.
+- The easy solutions are:
+  - important dims keep large `mu` and lower `sigma`, often globally;
+  - most other dims reduce `mu` toward zero and become inactive.
+- The loss has no term that controls per-feature low-sigma frequency, image-wise
+  low-sigma budget, or coverage across features, so it cannot distinguish
+  selective confidence from a few global confidence channels.
+
+Current conclusion:
+
+- `|mu| * sigma` is useful as a negative result.
+- It couples active `mu` and low `sigma`, but in this setup it behaves more like
+  `mu` pruning plus a few global low-sigma channels than like selective
+  per-image confidence.
+
+Recommended next direction:
+
+```text
+confidence = relu(1 - sigma)
+active_gate = stopgrad(sigmoid((|mu| - threshold) / temperature))
+```
+
+Use explicit selectivity constraints rather than only a pointwise product:
+
+- penalize low sigma when `mu` is inactive:
+  `mean((1 - active_gate) * confidence)`;
+- cap per-feature low-sigma frequency:
+  `relu(mean_B[sigma < threshold] - max_frac)`;
+- cap per-image low-sigma budget:
+  `relu(mean_D[sigma < threshold] - max_dims_per_image)`;
+- add a coverage term only if dead features must be reduced, e.g. a very soft
+  minimum low-sigma frequency or active frequency target, but avoid forcing all
+  features to be confident.
+
+## Pruning and Feature Visualizations
+
+Post-hoc pruning:
+
+- Script: `scripts/lat_pruning_eval.py`
+- For MLP decoders, supported criteria are `kl`, `l1`, and `mu_var`.
+- `dec_norm` is available only for linear-decoder checkpoints.
+- The pruning test replaces pruned dims either with prior samples or zeros and
+  plots reconstruction MSE versus number of dims kept.
+
+Key pruning observations:
+
+- Baseline `s1_grid_b1e-4_l100` and sigma-regularized variants are saved under
+  `visualizations/pruning/`.
+- For `s1_grid_b1e-4_l100_sigmadev_l1_sd0p5_below`, KL and L1 pruning behaved
+  similarly. The 1% free-prune point was roughly `prune 335 / keep 5809`, so
+  prior-fill pruning was not very forgiving despite many features having low
+  per-image KL selectivity.
+
+Feature image probes:
+
+- `scripts/query_kl_top_dims_grid.py` selects top-K latent dims by per-image KL
+  for a query image and sorts those dims by query `mu`.
+- `scripts/feature_topkl_sorted_by_mu.py` selects top-K images by per-image KL
+  for one feature and sorts those images by `mu`.
+- `scripts/feature_mu_extreme_grid.py` shows the most negative and most positive
+  `mu` images for one feature.
+
+Recent feature probes used image index `2685` and the high-KL feature dims:
+
+- `4560`
+- `1947`
+- `2668`
+- `264`
+- `1414`
+- `3547`
+
+Outputs are under:
+
+- `visualizations/query_kl_top_dims/`
+- `visualizations/feature_topkl_mu_sorted/`
+- `visualizations/feature_mu_extremes/`
+
+## Pruned Experiment Traces
+
+The following additional Stage-1 directions were tried, then their training
+code, checkpoints, logs, and non-grid visualizations were pruned to keep only
+the default grid path:
+
+- low-beta sample KL sweeps: `s1_lowb_*`, `s1_vlowb_*`
+- tier sweeps for beta/lambda/warmup selection: `s1_tierA_*`, `s1_tierB_*`, `s1_tierC_*`
+- feature-level KL variants: `s1_featkl_*`
+- squared feature-level KL: `s1_featkl_sq_*`
+- log feature-level KL variants: `s1_featkl_log_*`, `s1_featkl_newloss_*`
+- sample KL plus L1 on `mu`: `s1_samplel1_*`
+- feature-axis SIGReg: `s1_featsr_*`
+- SIGReg-only beta-zero runs: `s1_sigreg_only_*`
+- B-space SIGReg: `s1_bspace_sigreg_*`
+- deterministic AE / no-reparameterization runs: `s1_det_ae_*`
+
+## Main Files
+
+| File | Role |
+|---|---|
+| `src/vae_sigreg/model.py` | `OvercompleteVariationalAE` architecture |
+| `src/vae_sigreg/losses.py` | reconstruction, KL, and SIGReg losses |
+| `src/vae_sigreg/diagnostics.py` | latent diagnostics |
+| `src/vae_sigreg/sample.py` | prior sampling helper |
+| `train_run.py` | Stage-1 training entry point |

@@ -8,7 +8,7 @@
 #  3   0      100
 #  4   1e-3   0
 #  5   1e-3   1
-#  6   1e-3   10     ← already done (s1_tierA_b1e-3_l10_w50)
+#  6   1e-3   10
 #  7   1e-3   100
 #  8   1e-2   0
 #  9   1e-2   1
@@ -34,12 +34,6 @@ IDX=${SLURM_ARRAY_TASK_ID:-0}
 BETA=${BETAS[$IDX]}
 LAMBDA=${LAMBDAS[$IDX]}
 
-# IDX=6 already done
-if [[ "$IDX" == "6" ]]; then
-    echo "[skip] IDX=6 (beta=1e-3 lambda=10) already trained as s1_tierA_b1e-3_l10_w50"
-    exit 0
-fi
-
 RUN_TAG="s1_grid_b${BETA}_l${LAMBDA}"
 echo "[grid] idx=$IDX  beta=$BETA  lambda=$LAMBDA  tag=$RUN_TAG"
 
@@ -53,14 +47,13 @@ PYTHONUNBUFFERED=1 python train_run.py \
   --latent_dim    6144 \
   --num_layers    4 \
   --epochs        200 \
-  --batch_size    512 \
-  --accum_steps   4 \
+  --batch_size    2048 \
+  --accum_steps   1 \
   --lr            3e-4 \
   --weight_decay  1e-2 \
   --beta_kl       "$BETA" \
   --beta_kl_warmup_epochs 50 \
   --lambda_sigreg "$LAMBDA" \
-  --sigreg_type   epps_pulley \
   --num_projections 512 \
   --dead_activation_thresholds 0.1 0.5 1.0 \
   --ckpt_dir      "$CKPT_DIR" \

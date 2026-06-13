@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,132 +21,88 @@ def kl_bottleneck_loss(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
     return kl_per_sample.mean()
 
 
-def kl_feature_level(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+def sigma_feature_deviation_loss(
+    logvar: torch.Tensor,
+    target: float = 1.0,
+    metric: str = "l2",
+    only_below: bool = False,
+) -> torch.Tensor:
     """
-    Per-feature batch moment matching: for each dim d, match the batch-level
-    distribution of mu and sigma to N(0,1) using squared L2 penalty.
+    Batch feature-axis sigma regularizer.
 
-      mean_penalty_d = ( E_n[mu[n,d]] )^2          → batch mean mu should be 0
-      var_penalty_d  = ( E_n[sigma[n,d]^2] - 1 )^2 → batch mean sigma^2 should be 1
-
-    loss = sum_d ( mean_penalty_d + var_penalty_d )
-
-    Why this is better than kl_bottleneck for selectivity:
-      - kl_bottleneck gradient w.r.t. mu[n,d] = beta * mu[n,d]
-        → large mu (informative) gets large gradient → always fighting reconstruction
-      - this gradient w.r.t. mu[n,d] = 2 * mu_mean_d / B
-        → gradient is the SAME for all samples, scaled by the batch mean
-        → selective feature (mu large for few images): mu_mean_d is small
-          → gradient is small → reconstruction can dominate → feature stays active
-        → always-on feature (mu nonzero for all images): mu_mean_d is large
-          → gradient is large → penalised
+    For each latent feature d, compute mean_B[sigma_{b,d}] over the current
+    physical batch and penalize its deviation from target, usually 1.0.
+    This keeps posterior stds close to the prior scale at the feature level.
     """
-    mu_mean    = mu.mean(dim=0)             # [D]
-    sigma2_mean = logvar.exp().mean(dim=0)  # [D]
+    if logvar.ndim != 2:
+        raise ValueError(f"Expected logvar with shape [B, D], got {tuple(logvar.shape)}")
+    sigma_mean = (0.5 * logvar.float()).exp().mean(dim=0)
+    dev = sigma_mean - float(target)
+    if only_below:
+        dev = torch.clamp(dev, max=0.0)
+    if metric == "l1":
+        return dev.abs().mean()
+    if metric == "l2":
+        return dev.pow(2).mean()
+    raise ValueError(f"Unknown sigma deviation metric: {metric}")
 
-    mean_penalty = mu_mean.pow(2)           # [D]
-    var_penalty  = (sigma2_mean - 1).pow(2) # [D]
 
-    return (mean_penalty + var_penalty).sum()
-
-
-def kl_feature_level_log(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
+def sigma_low_fraction_loss(
+    logvar: torch.Tensor,
+    threshold: float = 0.8,
+    target_fraction: float = 0.1,
+    min_fraction: float = 0.0,
+    temperature: float = 0.05,
+) -> torch.Tensor:
     """
-    Decomposed sparsity-inducing KL: log penalty on mu, direct KL on sigma.
+    Soft feature-wise low-sigma fraction band regularizer.
 
-      mu_term    = sum_d log(1 + mean_n[mu[n,d]²])
-                   → sparsity: active dims saturate, gradient ∝ 1/(1+mean_mu²)
-      sigma_term = sum_d mean_n[sigma[n,d]² - log(sigma[n,d]²) - 1]
-                   → sigma stays in (0,∞): -log term → ∞ as sigma→0 (prevents collapse)
-                                           sigma² term → ∞ as sigma→∞ (prevents >1)
+    For each latent feature d, compute:
+        low_score_bd = sigmoid((threshold - sigma_bd) / temperature)
+        low_frac_d = mean_B[low_score_bd]
 
-    Keeping sigma OUTSIDE the log prevents saturation that caused sigma→0 in the
-    previous (combined) version.
+    Then penalize low_frac_d outside [min_fraction, target_fraction]. This
+    discourages global confidence while also pushing dead features to become
+    selectively confident on at least a small fraction of images.
     """
-    mu2_mean      = mu.pow(2).mean(dim=0)                   # [D], ≥0
-    kl_sigma_mean = (logvar.exp() - logvar - 1).mean(dim=0) # [D], ≥0
-    return torch.log1p(mu2_mean).sum() + kl_sigma_mean.sum()
+    if logvar.ndim != 2:
+        raise ValueError(f"Expected logvar with shape [B, D], got {tuple(logvar.shape)}")
+    sigma = (0.5 * logvar.float()).exp()
+    temp = max(float(temperature), 1e-6)
+    low_score = torch.sigmoid((float(threshold) - sigma) / temp)
+    low_frac = low_score.mean(dim=0)
+    over = torch.relu(low_frac - float(target_fraction))
+    under = torch.relu(float(min_fraction) - low_frac)
+    return (over + under).mean()
 
 
-def l1_mu_loss(mu: torch.Tensor) -> torch.Tensor:
+def sigma_low_tail_target_loss(
+    logvar: torch.Tensor,
+    tail_fraction: float = 0.05,
+    target: float = 0.5,
+    metric: str = "l2",
+) -> torch.Tensor:
     """
-    L1 penalty on encoder mean: mean_N mean_D |mu_{n,d}|.
+    Pull each feature's low-sigma tail toward a target value.
 
-    Adds a Laplace prior on mu alongside the Gaussian prior from KL.
-    Unlike KL's gradient ∝ mu (small mu → small gradient), the L1 gradient is
-    ±alpha (constant magnitude), so near-zero dims get pushed harder toward
-    exactly 0, sharpening sparsity.
+    For every latent feature d, take the lowest tail_fraction of sigma over the
+    current batch, average those selected values, and penalize deviation from
+    target. This directly encourages each feature to have a small subset of
+    images with genuinely low confidence scale, e.g. sigma around 0.5.
     """
-    return mu.abs().mean()
-
-
-def kl_feature_level_sq(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
-    """
-    Per-dim squared mean-KL loss.
-
-    For each dim d:
-      f_d = mean_n[mu[n,d]²] + mean_n[sigma[n,d]² - log(sigma[n,d]²) - 1]
-          = 2 * mean_n[ KL(q(z_d|x_n) || N(0,1)) ]
-
-    loss = sum_d( f_d² )
-
-    Gradient w.r.t. mu[n,d] ∝ mean_n[KL_d] * mu[n,d]:
-      - inactive dim (mean KL ≈ 0): gradient ≈ 0 → reconstruction dominates → feature survives
-      - always-on dim (mean KL large): gradient large → pushed to prior
-    No sign-cancellation: mu² ≥ 0 and sigma²-log(sigma²)-1 ≥ 0 for all inputs.
-    """
-    mu2_mean      = mu.pow(2).mean(dim=0)                          # [D]
-    kl_sigma_mean = (logvar.exp() - logvar - 1).mean(dim=0)        # [D]
-    per_dim       = mu2_mean + kl_sigma_mean                       # [D], = 2*mean_n[KL_{n,d}]
-    return per_dim.pow(2).sum()
-
-
-class MomentSIGRegLoss(nn.Module):
-    """Sliced moment-matching SIGReg kept for ablations."""
-
-    def __init__(
-        self,
-        num_projections: int = 256,
-        lambda_skew: float = 0.1,
-        lambda_kurt: float = 0.1,
-        eps: float = 1e-6,
-    ):
-        super().__init__()
-        self.num_projections = num_projections
-        self.lambda_skew = lambda_skew
-        self.lambda_kurt = lambda_kurt
-        self.eps = eps
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        B, D = z.shape
-
-        # Historical implementation centered z before sliced moments.
-        z_centered = z - z.mean(dim=0, keepdim=True)
-
-        A = torch.randn(self.num_projections, D, device=z.device, dtype=z.dtype)
-        A = F.normalize(A, dim=1)
-        y = z_centered @ A.T
-
-        mean_y = y.mean(dim=0)
-        var_y = y.var(dim=0, unbiased=False)
-
-        y_c = y - mean_y.unsqueeze(0)
-        std_y = (var_y + self.eps).sqrt()
-
-        skew_y = y_c.pow(3).mean(dim=0) / (std_y.pow(3) + self.eps)
-        kurt_y = y_c.pow(4).mean(dim=0) / (std_y.pow(4) + self.eps)
-
-        mean_penalty = mean_y.pow(2).mean()
-        var_penalty = (var_y - 1).pow(2).mean()
-        skew_penalty = skew_y.pow(2).mean()
-        kurt_penalty = (kurt_y - 3).pow(2).mean()
-
-        return (
-            mean_penalty
-            + var_penalty
-            + self.lambda_skew * skew_penalty
-            + self.lambda_kurt * kurt_penalty
-        )
+    if logvar.ndim != 2:
+        raise ValueError(f"Expected logvar with shape [B, D], got {tuple(logvar.shape)}")
+    sigma = (0.5 * logvar.float()).exp()
+    B = sigma.shape[0]
+    k = max(1, min(B, int(round(B * float(tail_fraction)))))
+    tail = torch.topk(sigma, k=k, dim=0, largest=False).values
+    tail_mean = tail.mean(dim=0)
+    dev = tail_mean - float(target)
+    if metric == "l1":
+        return dev.abs().mean()
+    if metric == "l2":
+        return dev.pow(2).mean()
+    raise ValueError(f"Unknown sigma low-tail metric: {metric}")
 
 
 class EppsPulleySIGReg(nn.Module):
@@ -222,56 +176,31 @@ class EppsPulleySIGReg(nn.Module):
         return torch.nan_to_num(loss, nan=1e6, posinf=1e6, neginf=1e6)
 
 
-class NullSIGRegLoss(nn.Module):
-    """No-op SIGReg for ablations."""
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        return z.sum() * 0.0
-
-
 def build_sigreg_loss(
-    sigreg_type: str = "epps_pulley",
     num_projections: int = 256,
     ep_num_points: int = 33,
     ep_t_min: float = -5.0,
     ep_t_max: float = 5.0,
     ep_weighted: bool = True,
     ep_slice_chunk_size: int = 256,
-) -> nn.Module:
-    """Factory used by training scripts to select the SIGReg variant."""
-    if sigreg_type == "moment":
-        return MomentSIGRegLoss(num_projections=num_projections)
-    if sigreg_type == "epps_pulley":
-        return EppsPulleySIGReg(
-            num_slices=num_projections,
-            num_points=ep_num_points,
-            t_min=ep_t_min,
-            t_max=ep_t_max,
-            weighted=ep_weighted,
-            slice_chunk_size=ep_slice_chunk_size,
-        )
-    if sigreg_type == "none":
-        return NullSIGRegLoss()
-    raise ValueError(f"Unknown sigreg_type: {sigreg_type}")
+) -> EppsPulleySIGReg:
+    """Build the default D-space Epps-Pulley SIGReg loss."""
+    return EppsPulleySIGReg(
+        num_slices=num_projections,
+        num_points=ep_num_points,
+        t_min=ep_t_min,
+        t_max=ep_t_max,
+        weighted=ep_weighted,
+        slice_chunk_size=ep_slice_chunk_size,
+    )
 
 
 def sigreg_loss(
     z: torch.Tensor,
     num_projections: int = 256,
-    bandwidths: Optional[torch.Tensor] = None,
-    eps: float = 1e-6,
-    sigreg_type: str = "epps_pulley",
     ep_num_points: int = 33,
 ) -> torch.Tensor:
-    """
-    Backward-compatible functional SIGReg entry point.
-
-    The default is now sliced Epps-Pulley characteristic-function matching.
-    Pass sigreg_type="moment" to reproduce the older moment ablation.
-    """
-    del bandwidths, eps
     return build_sigreg_loss(
-        sigreg_type=sigreg_type,
         num_projections=num_projections,
         ep_num_points=ep_num_points,
     )(z)

@@ -17,10 +17,9 @@ class OvercompleteVariationalAE(nn.Module):
     Overcomplete VAE: latent_dim may be larger than input_dim.
 
     Encoder maps x -> (mu, logvar) via MLP with LayerNorm + GELU.
-    Decoder maps z -> x_hat. When linear_decoder=True (default), decoder is a
-    single affine layer z -> x_hat, which prevents dead features by ensuring
-    every latent dimension receives reconstruction gradients directly.
-    When linear_decoder=False, decoder uses the same MLP structure as before.
+    Decoder maps z -> x_hat. By default, the decoder is an MLP mirroring the
+    encoder block structure. Set linear_decoder=True to use a single affine
+    layer z -> x_hat.
 
     hidden_dim defaults to input_dim * 4 (e.g. 768 -> 3072).
     """
@@ -31,9 +30,11 @@ class OvercompleteVariationalAE(nn.Module):
         latent_dim: int,
         hidden_dim: Optional[int] = None,
         num_layers: int = 2,
-        linear_decoder: bool = True,
+        linear_decoder: bool = False,
+        use_reparameterization: bool = True,
     ):
         super().__init__()
+        del use_reparameterization
         if hidden_dim is None:
             hidden_dim = input_dim * 4
 
